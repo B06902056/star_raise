@@ -316,6 +316,9 @@ class Unit(GameSprite):
         # 當前鎖定目標（combat 狀態用）
         self._locked_enemy: Optional["Unit"] = None
 
+        # 基地攻擊：鎖定的敵方建築
+        self._target_building: Optional["Building"] = None
+
     # ── 移動介面 ──────────────────────────────────────────────────────────────
     def move_to(self, target: tuple[float, float]) -> None:
         self.target = list(target)
@@ -399,16 +402,64 @@ class Unit(GameSprite):
             vfx_callback(tuple(self.pos))
         print(f"[Unit] 💀 {self.kind} (team={self.team}) 陣亡於 {self.pos}")
 
+    # ── 建築掃描 ──────────────────────────────────────────────────────────────
+    def scan_for_buildings(
+        self, buildings: list["Building"]
+    ) -> Optional["Building"]:
+        """
+        回傳距離最近的存活敵方建築（不限掃描範圍，用於 lane 終點攻城）。
+        僅在 waypoints 耗盡後啟用，確保單位先完成行軍再攻城。
+        """
+        nearest: Optional[Building] = None
+        nearest_dist = float("inf")
+        for b in buildings:
+            if b.team == self.team or b.is_dead:
+                continue
+            d = self.dist_to(b)
+            if d < nearest_dist:
+                nearest      = b
+                nearest_dist = d
+        return nearest
+
+    # ── 攻擊建築 ──────────────────────────────────────────────────────────────
+    def attack_building(
+        self,
+        building: "Building",
+        vfx_callback: Optional[VFXCallback] = None,
+    ) -> None:
+        """
+        對建築施加傷害（與攻擊 Unit 共用同一冷卻計時器）。
+        單位會持續朝建築旋轉並保持在攻擊距離內停步。
+        """
+        if self.atk_timer < self.atk_cd:
+            return
+        self.atk_timer = 0
+        building.take_damage(self.atk_dmg, vfx_callback)
+        if vfx_callback:
+            mid = (
+                (self.pos[0] + building.pos[0]) / 2,
+                (self.pos[1] + building.pos[1]) / 2,
+            )
+            vfx_callback(mid)
+
     # ── 每幀更新 ──────────────────────────────────────────────────────────────
     def update(
         self,
         enemies: Optional[list["Unit"]] = None,
         vfx_callback: Optional[VFXCallback] = None,
+        enemy_buildings: Optional[list["Building"]] = None,
     ) -> None:
         """
-        FSM 更新主入口。
-        - 傳入 enemies list 時啟用掃描 + 攻擊邏輯
-        - 未傳入時退化為純移動模式（向後相容）
+        FSM 更新主入口。優先順序：
+          1. 戰鬥（有敵方 Unit 在 scan_range 內）
+          2. 行軍（沿 waypoints 前進）
+          3. 攻城（waypoints 耗盡後，攻打最近敵方建築）
+
+        Parameters
+        ----------
+        enemies         : 存活 Unit 列表，啟用掃描攻擊
+        vfx_callback    : 爆炸特效回調
+        enemy_buildings : 敵方建築列表，waypoints 完成後啟用攻城
         """
         if self.is_dead:
             return
@@ -417,30 +468,57 @@ class Unit(GameSprite):
         if self.atk_timer < self.atk_cd:
             self.atk_timer += 1
 
-        # ── 掃描邏輯 ──────────────────────────────────────────────────────────
+        # ── 優先級 1: 對抗敵方 Unit ───────────────────────────────────────────
         if enemies is not None:
             target_enemy = self.scan_for_enemies(enemies)
 
             if target_enemy:
-                # 切換到 combat：停止前進，朝敵旋轉
                 if self.state == "march":
                     self.state = "combat"
                     self._locked_enemy = target_enemy
+                    self._target_building = None   # 放棄攻城
                 self.rotate_to(tuple(target_enemy.pos))
                 self.attack(target_enemy, vfx_callback)
-                return   # combat 狀態不移動
+                return   # combat 中不移動
 
             else:
-                # 敵人離開範圍（或已死亡）→ 恢復行軍
                 if self.state == "combat":
                     self.state = "march"
                     self._locked_enemy = None
-                    # 恢復剩餘 waypoints
                     if self.waypoints:
                         self.move_to(self.waypoints[0])
 
-        # ── 移動邏輯（march 狀態）─────────────────────────────────────────────
-        self._march_step()
+        # ── 優先級 2: 仍有 waypoints → 繼續行軍 ──────────────────────────────
+        if self.target or self.waypoints:
+            self._march_step()
+            return
+
+        # ── 優先級 3: waypoints 耗盡 → 攻城模式 ──────────────────────────────
+        if enemy_buildings is not None:
+            # 更新或重新鎖定目標建築（前目標被摧毀時重掃）
+            if (self._target_building is None
+                    or self._target_building.is_dead):
+                self._target_building = self.scan_for_buildings(enemy_buildings)
+
+            if self._target_building and not self._target_building.is_dead:
+                self.state = "assault"
+                self.rotate_to(tuple(self._target_building.pos))
+                # 靠近建築（攻擊範圍 = 碰撞半徑 + 建築半徑 + 10px 緩衝）
+                atk_range = (self.collision_radius
+                             + self._target_building.collision_radius + 10)
+                if self.dist_to(self._target_building) > atk_range:
+                    # 向建築前進一步
+                    dx = self._target_building.pos[0] - self.pos[0]
+                    dy = self._target_building.pos[1] - self.pos[1]
+                    dist = math.hypot(dx, dy)
+                    if dist > 1e-6:
+                        self.pos[0] += (dx / dist) * self.speed
+                        self.pos[1] += (dy / dist) * self.speed
+                else:
+                    self.attack_building(self._target_building, vfx_callback)
+            else:
+                self._target_building = None
+                self.state = "march"
 
     def _march_step(self) -> None:
         """沿 target / waypoints 前進一幀。"""
@@ -477,7 +555,12 @@ class Unit(GameSprite):
         # 掃描範圍圓（半透明感用低飽和色）
         cx = int(self.pos[0]) - camera_offset[0]
         cy = int(self.pos[1]) - camera_offset[1]
-        color = (80, 160, 255) if self.state == "march" else (255, 80, 80)
+        color = {
+            "march":   (80, 160, 255),
+            "combat":  (255, 80,  80),
+            "assault": (255, 160, 0),
+            "dead":    (80,  80,  80),
+        }.get(self.state, (200, 200, 200))
         pygame.draw.circle(screen, color, (cx, cy), int(self.scan_range), 1)
 
     def _draw_hp_bar(self, screen: pygame.Surface, camera_offset: tuple[int, int]) -> None:

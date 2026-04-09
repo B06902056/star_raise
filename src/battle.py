@@ -1,5 +1,5 @@
 """
-battle.py — Star Raise Game  (v2: Battle Logic)
+battle.py — Star Raise Game  (v4: Base Assault)
 BattleManager: 統一處理碰撞分離、戰鬥回合、死亡清理。
 
 碰撞邏輯
@@ -15,7 +15,7 @@ import math
 from typing import Optional, Callable
 
 # 使用相對 import 確保模組內部一致
-from src.sprite import Unit, VFXSprite
+from src.sprite import Unit, Building, VFXSprite
 from src.asset_manager import AssetManager
 
 VFXCallback = Callable[[tuple[float, float]], None]
@@ -38,16 +38,22 @@ class BattleManager:
     def process_combat(
         units: list[Unit],
         vfx_callback: Optional[VFXCallback] = None,
+        buildings: Optional[list[Building]] = None,
     ) -> None:
         """
-        對所有存活單位執行「掃描 → 攻擊」一輪。
-        每個 Unit 呼叫 update(enemies, vfx_callback)：
-        - 若 scan_range 內有敵人 → 切換 combat，旋轉 + 攻擊
-        - 否則繼續 march
+        對所有存活單位執行「掃描 → 攻擊 → 攻城」一輪。
+        每個 Unit 呼叫 update(enemies, vfx_callback, enemy_buildings)：
+        - scan_range 內有敵 Unit → combat（攻擊單位）
+        - 行軍中     → march（沿 waypoints）
+        - waypoints 耗盡 → assault（攻打最近敵方建築）
         """
         living = [u for u in units if not u.is_dead]
         for unit in living:
-            unit.update(enemies=living, vfx_callback=vfx_callback)
+            unit.update(
+                enemies=living,
+                vfx_callback=vfx_callback,
+                enemy_buildings=buildings,
+            )
 
     # ── 2. 圓形碰撞分離 ───────────────────────────────────────────────────────
     @staticmethod

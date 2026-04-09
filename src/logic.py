@@ -1,7 +1,8 @@
 """
-logic.py — Star Raise Game  (v3: Economy & Spawning)
+logic.py — Star Raise Game  (v4: AI Controller)
 ResourceManager : 礦石收入、消費、週期計時
 ProductionQueue : 建築生產佇列（一次只跑一個 job）
+AIController    : 敵方 AI 決策（每 10 秒評估一次）
 
 數值設計
 --------
@@ -15,6 +16,7 @@ Tank:    成本 150，建造 300 幀 (5s)
 """
 
 from __future__ import annotations
+import random
 from typing import Optional
 
 # ── 全域數值表（單一修改來源）────────────────────────────────────────────────────
@@ -216,3 +218,124 @@ class ProductionQueue:
     def queue_summary(self) -> list[str]:
         """回傳佇列中所有 unit_type 的列表（供 UI 顯示）。"""
         return [j["unit_type"] for j in self._queue]
+
+
+# ── AIController ──────────────────────────────────────────────────────────────
+# 決策週期
+AI_DECISION_FRAMES: int = 600   # 10 秒 @ 60fps
+
+class AIController:
+    """
+    敵方 AI 決策模組。每 600 幀（10 秒）評估一次，
+    根據礦石餘額決定生產哪種單位並加入 ProductionQueue。
+
+    決策規則
+    --------
+    minerals >= 150 → 40% 機率生產 Tank，60% 機率生產 Marine
+    50 <= minerals < 150 → 生產 Marine
+    minerals < 50  → 本輪跳過
+
+    設計原則
+    --------
+    - AI 使用與玩家相同的 ResourceManager / ProductionQueue API，保證公平性
+    - 隨機性透過 random.random() 實現，可在初始化時設定 seed 以利測試
+    - update() 同時驅動收入週期 + 佇列進度 + 決策計時，
+      GameLoop 只需每幀呼叫一次 update()
+
+    使用方式
+    --------
+    ai = AIController(resource_mgr, queue, spawn_pos)
+    finished = ai.update()   # 每幀呼叫；有單位完成時回傳 unit_type
+    """
+
+    def __init__(
+        self,
+        resource_mgr: ResourceManager,
+        queue: ProductionQueue,
+        *,
+        decision_frames: int = AI_DECISION_FRAMES,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.resource_mgr    = resource_mgr
+        self.queue           = queue
+        self.decision_frames = decision_frames
+        self._timer: int     = 0
+        self._rng            = random.Random(seed)   # 獨立隨機器，不汙染全局狀態
+
+        # 統計（供 API / HUD 顯示）
+        self.total_spawned:  int = 0
+        self.last_decision:  str = "idle"
+
+    # ── 每幀更新（主入口）────────────────────────────────────────────────────
+    def update(self) -> Optional[str]:
+        """
+        每幀呼叫。流程：
+        1. ResourceManager 收入週期
+        2. ProductionQueue 建造進度
+        3. 決策計時 → 觸發 _decide()
+
+        回傳值：有單位完成生產時回傳 unit_type 字串，否則 None。
+        """
+        # 1) 被動收入
+        self.resource_mgr.update()
+
+        # 2) 佇列推進
+        finished = self.queue.update()
+        if finished:
+            self.total_spawned += 1
+
+        # 3) 決策計時
+        self._timer += 1
+        if self._timer >= self.decision_frames:
+            self._timer = 0
+            self._decide()
+
+        return finished
+
+    # ── 決策邏輯 ──────────────────────────────────────────────────────────────
+    def _decide(self) -> None:
+        """
+        核心決策：依礦石餘額與隨機權重選擇生產目標。
+
+        分支邏輯
+        --------
+        minerals >= 150:
+            roll = random()
+            roll < 0.40  → enqueue "tank"   (40%)
+            roll >= 0.40 → enqueue "marine" (60%)
+        50 <= minerals < 150:
+            enqueue "marine"
+        minerals < 50:
+            跳過（資源不足）
+        """
+        minerals = self.resource_mgr.minerals
+
+        if minerals >= UNIT_COSTS["tank"]:
+            roll = self._rng.random()
+            if roll < 0.40:
+                chosen = "tank"
+            else:
+                chosen = "marine"
+        elif minerals >= UNIT_COSTS["marine"]:
+            chosen = "marine"
+        else:
+            self.last_decision = f"skip (minerals={minerals})"
+            print(f"[AI] ⏸  礦石不足 ({minerals})，跳過本輪")
+            return
+
+        ok = self.queue.enqueue(chosen, self.resource_mgr)
+        self.last_decision = f"{chosen} ({'ok' if ok else 'queue_full'})"
+        print(f"[AI] 🤖 決策: {chosen}  roll={self._rng.random():.2f}  "
+              f"minerals={minerals}  result={self.last_decision}")
+
+    # ── 狀態摘要 ──────────────────────────────────────────────────────────────
+    def status(self) -> dict:
+        return {
+            "minerals":       self.resource_mgr.minerals,
+            "income":         self.resource_mgr.income_per_cycle,
+            "queue_len":      self.queue.queue_len,
+            "current_unit":   self.queue.current_unit,
+            "last_decision":  self.last_decision,
+            "total_spawned":  self.total_spawned,
+            "next_decision":  self.decision_frames - self._timer,
+        }
