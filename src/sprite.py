@@ -1,6 +1,6 @@
 """
-sprite.py — Star Raise Game  (v2: Battle Logic)
-定義 Sprite 基底類別、Building、Unit（含戰鬥 FSM）、VFXSprite。
+sprite.py — Star Raise Game  (v3: Economy & Spawning)
+定義 Sprite 基底類別、Building（含生產介面）、Unit（含戰鬥 FSM）、VFXSprite。
 
 Unit 狀態機
 -----------
@@ -9,12 +9,21 @@ Unit 狀態機
                        hp <= 0
                           ▼
                          dead
+
+Building 角色
+-------------
+  "barracks"  → produce(unit_type) 委派給 ProductionQueue
+  "refinery"  → 建立時通知 ResourceManager.register_refinery()
 """
 
+from __future__ import annotations
 import math
 import pygame
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
 from src.asset_manager import AssetManager
+
+if TYPE_CHECKING:
+    from src.logic import ResourceManager, ProductionQueue
 
 # VFX 回調型別: (pos: tuple[float, float]) -> None
 VFXCallback = Callable[[tuple[float, float]], None]
@@ -133,6 +142,12 @@ class Building(GameSprite):
 
     NAMES = {"barracks": "兵營", "refinery": "採礦場"}
 
+    # 不同建築種類的出兵點偏移（相對建築中心）
+    SPAWN_OFFSET: dict[str, tuple[int, int]] = {
+        "barracks": (80, 0),    # 兵營右側生成
+        "refinery": (80, 0),
+    }
+
     def __init__(
         self,
         kind: str,
@@ -146,9 +161,41 @@ class Building(GameSprite):
         self.hp        = hp
         self.max_hp    = hp
         self.team      = team
-        self.producing = False
         self.is_dead   = False
 
+        # 生產佇列（由 main.py 外部注入，Barracks 專用）
+        self.queue: Optional[ProductionQueue] = None
+
+        # 被動收入角色（Refinery 設 True，由 main.py 搭配 ResourceManager 使用）
+        self.gives_income: bool = (kind == "refinery")
+
+    # ── 出兵點屬性 ────────────────────────────────────────────────────────────
+    @property
+    def spawn_point(self) -> tuple[float, float]:
+        """
+        單位生產完成後的出現座標。
+        team=0（玩家）右偏，team=1（敵方）左偏。
+        """
+        ox, oy = self.SPAWN_OFFSET.get(self.kind, (80, 0))
+        if self.team == 1:
+            ox = -ox   # 敵方建築向左生成
+        return (self.pos[0] + ox, self.pos[1] + oy)
+
+    # ── 生產介面 ──────────────────────────────────────────────────────────────
+    def produce(self, unit_type: str, resource_mgr: ResourceManager) -> bool:
+        """
+        委派生產任務給已注入的 ProductionQueue。
+        回傳 True 表示成功入隊；若無佇列或資源不足則 False。
+        """
+        if self.is_dead:
+            print(f"[Building] ⚠️  建築已摧毀，無法生產")
+            return False
+        if self.queue is None:
+            print(f"[Building] ⚠️  {self.kind} 沒有生產佇列")
+            return False
+        return self.queue.enqueue(unit_type, resource_mgr)
+
+    # ── 受傷 / 死亡 ───────────────────────────────────────────────────────────
     def take_damage(self, amount: int, vfx_callback: Optional[VFXCallback] = None) -> None:
         if self.is_dead:
             return
@@ -160,30 +207,50 @@ class Building(GameSprite):
         self.is_dead = True
         if vfx_callback:
             vfx_callback(tuple(self.pos))
+        print(f"[Building] 💀 {self.kind} (team={self.team}) 被摧毀")
 
+    # ── 渲染 ──────────────────────────────────────────────────────────────────
     def draw(self, screen: pygame.Surface, camera_offset: tuple[int, int] = (0, 0)) -> None:
         if self.is_dead:
             return
         super().draw(screen, camera_offset)
         self._draw_hp_bar(screen, camera_offset)
-        if self.producing:
-            self._draw_produce_indicator(screen, camera_offset)
+        # 正在生產時顯示進度弧
+        if self.queue and self.queue.is_busy:
+            self._draw_production_bar(screen, camera_offset)
+        # 煉油廠標示
+        if self.gives_income:
+            self._draw_refinery_indicator(screen, camera_offset)
 
     def _draw_hp_bar(self, screen: pygame.Surface, camera_offset: tuple[int, int]) -> None:
         cx = int(self.pos[0]) - camera_offset[0]
         cy = int(self.pos[1]) - camera_offset[1]
         bar_w, bar_h = 80, 6
         x = cx - bar_w // 2
-        y = cy - self.surface.get_height() // 2 - 12
+        y = cy - self.surface.get_height() // 2 - 22
         ratio = max(0.0, self.hp / self.max_hp)
         pygame.draw.rect(screen, (80, 0, 0),    (x, y, bar_w, bar_h))
         pygame.draw.rect(screen, (0, 200, 60),  (x, y, int(bar_w * ratio), bar_h))
         pygame.draw.rect(screen, (200, 200, 200),(x, y, bar_w, bar_h), 1)
 
-    def _draw_produce_indicator(self, screen: pygame.Surface, camera_offset: tuple[int, int]) -> None:
+    def _draw_production_bar(self, screen: pygame.Surface, camera_offset: tuple[int, int]) -> None:
+        """在建築下方繪製生產進度條。"""
         cx = int(self.pos[0]) - camera_offset[0]
         cy = int(self.pos[1]) - camera_offset[1]
-        pygame.draw.circle(screen, (255, 220, 0), (cx + 36, cy - 36), 6)
+        bar_w, bar_h = 80, 5
+        x = cx - bar_w // 2
+        y = cy + self.surface.get_height() // 2 + 4
+        progress = self.queue.current_progress if self.queue else 0.0
+        pygame.draw.rect(screen, (40, 40, 80),  (x, y, bar_w, bar_h))
+        pygame.draw.rect(screen, (80, 160, 255),(x, y, int(bar_w * progress), bar_h))
+        pygame.draw.rect(screen, (120, 120, 180),(x, y, bar_w, bar_h), 1)
+
+    def _draw_refinery_indicator(self, screen: pygame.Surface, camera_offset: tuple[int, int]) -> None:
+        """煉油廠：右上角金色閃爍圓點。"""
+        cx = int(self.pos[0]) - camera_offset[0]
+        cy = int(self.pos[1]) - camera_offset[1]
+        pygame.draw.circle(screen, (255, 200, 30), (cx + 38, cy - 38), 7)
+        pygame.draw.circle(screen, (255, 255, 180),(cx + 38, cy - 38), 4)
 
 
 # ── 單位 ─────────────────────────────────────────────────────────────────────
