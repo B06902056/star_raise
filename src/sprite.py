@@ -25,10 +25,7 @@ import pygame
 from typing import Optional, Callable, TYPE_CHECKING
 
 from src.asset_manager import AssetManager
-from src.logic        import BUILDING_SPECS
-
-if TYPE_CHECKING:
-    pass   # no circular-import risk now
+from src.logic        import BUILDING_SPECS, ResourceManager
 
 VFXCallback = Callable[[tuple[float, float]], None]
 
@@ -258,6 +255,44 @@ class Building(GameSprite):
         if vfx_callback:
             vfx_callback(tuple(self.pos))
         print(f"[Building] {self.kind} (team={self.team}) destroyed")
+
+    def demolish(
+        self,
+        resource_mgr: ResourceManager,
+        vfx_callback: Optional[VFXCallback] = None,
+    ) -> int:
+        """
+        Player-initiated demolition of a slot building.
+
+        Actions (in order)
+        ------------------
+        1. Calculate refund = floor(self._cost × 0.6)  — 60 % of original cost.
+        2. Call resource_mgr.refund(refund) to credit minerals immediately.
+        3. Call resource_mgr.unregister_building(self) to stop income contribution.
+        4. Call self.die() to mark the sprite dead (triggers VFX if callback given).
+
+        Returns
+        -------
+        int  — the refund amount credited (useful for UI flash / logging).
+
+        Notes
+        -----
+        - HQ buildings (is_hq=True) cannot be demolished; returns 0 immediately.
+        - After demolish the caller should remove the building from slot_buildings
+          and free its slot index from _occupied_slots.
+        """
+        if self.is_hq or self.is_dead:
+            return 0
+
+        refund = int(self._cost * 0.6)
+        resource_mgr.refund(refund)
+        resource_mgr.unregister_building(self)
+        self.die(vfx_callback)
+        print(
+            f"[Building] demolish {self.kind}({self.lane})  "
+            f"cost={self._cost}  refund={refund}"
+        )
+        return refund
 
     # ── Rendering ─────────────────────────────────────────────────────────────
     def draw(self, screen: pygame.Surface, camera_offset: tuple[int, int] = (0, 0)) -> None:

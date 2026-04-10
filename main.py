@@ -31,6 +31,7 @@ Lane paths (straight horizontal, two Y-coordinates)
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import threading
@@ -42,7 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.asset_manager import AssetManager
 from src.sprite        import Building, Unit, VFXSprite
 from src.battle        import BattleManager
-from src.logic         import ResourceManager, BUILDING_SPECS, BASE_INCOME
+from src.logic         import ResourceManager, BUILDING_SPECS, BASE_INCOME, BuildState
 import src.shared as shared
 
 # ── Screen / world constants ──────────────────────────────────────────────────
@@ -106,6 +107,31 @@ COLOR_VICTORY   = ( 60, 220, 100)
 COLOR_DEFEAT    = (220,  60,  60)
 COLOR_TOP_LANE  = ( 80, 160, 255)
 COLOR_BOT_LANE  = (255, 160,  60)
+
+# ── Build-card layout (bottom HUD) ───────────────────────────────────────────
+# Three screen-fixed rectangles at the bottom:
+#   CARD_KINDS[0] → Barracks  (cost 100)
+#   CARD_KINDS[1] → Refinery  (cost 200)
+#   CARD_KINDS[2] → Demolish toggle button
+
+CARD_W, CARD_H = 90, 58
+CARD_Y         = SCREEN_H - CARD_H - 8
+CARD_KINDS     = ["barracks", "refinery", None]   # None = demolish button
+
+CARD_RECTS: list[pygame.Rect] = [
+    pygame.Rect(10  + i * (CARD_W + 8), CARD_Y, CARD_W, CARD_H)
+    for i in range(3)
+]
+# Override last card to sit on the right (demolish button)
+CARD_RECTS[2] = pygame.Rect(SCREEN_W - CARD_W - 10, CARD_Y, CARD_W, CARD_H)
+
+CARD_COSTS = {
+    "barracks": BUILDING_SPECS["barracks"]["cost"],   # 100
+    "refinery": BUILDING_SPECS["refinery"]["cost"],   # 200
+}
+
+# Snap radius: ghost snaps to a slot when cursor world-centre is within this px
+SNAP_RADIUS = SLOT_STEP * 1.2   # ≈ 86 px
 
 
 # ── FastAPI background thread ─────────────────────────────────────────────────
@@ -346,11 +372,112 @@ def draw_hud(
     screen.blit(
         font.render(
             f"FPS: {fps:.0f}   CAM: {cam_x:.0f} / {WORLD_W - SCREEN_W}   "
-            f"Drag to scroll  |  RMB move unit  |  D debug  |  R reset  |  ESC quit",
+            f"Drag to scroll  |  D demolish  |  RMB/ESC cancel  |  F1 debug  |  R reset  |  ESC quit",
             True, hint_col,
         ),
         (8, 32),
     )
+
+
+def draw_build_cards(
+    screen:      pygame.Surface,
+    font:        pygame.font.Font,
+    minerals:    int,
+    build_state: BuildState,
+    ghost_kind:  str | None,
+) -> None:
+    """
+    Bottom HUD — three build cards:
+      [Barracks 100]  [Refinery 200]        [DEMOLISH]
+
+    Visual states:
+      - Active card (being dragged):  bright border + lighter bg
+      - Demolish ON:                  red bg
+      - Insufficient minerals:        dimmed label + orange cost
+    """
+    for i, rect in enumerate(CARD_RECTS):
+        kind = CARD_KINDS[i]
+        is_demolish = (kind is None)
+
+        # Background
+        if is_demolish:
+            active = (build_state == BuildState.DEMOLISHING)
+            bg = (160, 30, 30) if active else (60, 20, 20)
+            border = (255, 80, 80) if active else (120, 60, 60)
+        else:
+            active = (ghost_kind == kind and build_state == BuildState.CONSTRUCTING)
+            cost   = CARD_COSTS[kind]
+            affordable = (minerals >= cost)
+            bg     = (40, 70, 50) if (active and affordable) else (25, 40, 60)
+            border = (80, 220, 120) if active else (
+                (100, 160, 220) if affordable else (80, 60, 60)
+            )
+
+        pygame.draw.rect(screen, bg,     rect)
+        pygame.draw.rect(screen, border, rect, 2)
+
+        # Label
+        if is_demolish:
+            label = "DEMOLISH"
+            label_col = (255, 100, 100) if build_state == BuildState.DEMOLISHING else (200, 120, 120)
+            hint  = "[D key]"
+            hint_col = (160, 80, 80)
+        else:
+            cost = CARD_COSTS[kind]
+            affordable = (minerals >= cost)
+            label = kind.upper()
+            label_col = (200, 230, 200) if affordable else (120, 100, 100)
+            hint  = f"{cost} min"
+            hint_col = COLOR_GOLD if affordable else (200, 120, 60)
+
+        screen.blit(font.render(label, True, label_col),
+                    (rect.x + 6, rect.y + 8))
+        screen.blit(font.render(hint,  True, hint_col),
+                    (rect.x + 6, rect.y + 26))
+        if not is_demolish:
+            unit = BUILDING_SPECS[kind]["unit_type"]
+            rate = BUILDING_SPECS[kind]["spawn_rate_frames"] // 60
+            screen.blit(font.render(f"→{unit} {rate}s", True, (120, 160, 200)),
+                        (rect.x + 6, rect.y + 42))
+
+
+def draw_ghost(
+    screen:       pygame.Surface,
+    font:         pygame.font.Font,
+    ghost_surf:   pygame.Surface | None,
+    ghost_screen: tuple[int, int],
+    snap_slot:    int | None,
+    snap_valid:   bool,
+    cam_x:        float,
+) -> None:
+    """
+    Render the ghost building sprite following the cursor during CONSTRUCTING.
+
+    - Ghost sprite: 50 % alpha at cursor position.
+    - Slot overlay: green (valid) or red (occupied/invalid) transparent rect
+      drawn at the snapped slot's world-to-screen position.
+    """
+    gx, gy = ghost_screen
+
+    # Slot highlight
+    if snap_slot is not None:
+        wx, wy = ALL_SLOTS[snap_slot]
+        sx = wx - int(cam_x)
+        col = (0, 220, 80, 90) if snap_valid else (220, 50, 50, 90)
+        hi = pygame.Surface((SLOT_SIZE, SLOT_SIZE), pygame.SRCALPHA)
+        hi.fill(col)
+        screen.blit(hi, (sx, wy))
+        border_col = (0, 255, 100) if snap_valid else (255, 60, 60)
+        pygame.draw.rect(screen, border_col, (sx, wy, SLOT_SIZE, SLOT_SIZE), 2)
+        label = "Place" if snap_valid else "Occupied"
+        screen.blit(font.render(label, True, border_col), (sx + 2, wy - 14))
+
+    # Ghost sprite
+    if ghost_surf is not None:
+        alpha_surf = ghost_surf.copy()
+        alpha_surf.set_alpha(160)
+        rect = alpha_surf.get_rect(center=(gx, gy))
+        screen.blit(alpha_surf, rect)
 
 
 def draw_result_overlay(screen: pygame.Surface, result: str) -> None:
@@ -455,6 +582,21 @@ class GameLoop:
         self.game_result: str | None    = None
         self.debug_mode:  bool          = False
         self.income_flash:int           = 0
+
+        # ── Phase 3: Build / demolish state ───────────────────────────────────
+        self.build_state: BuildState     = BuildState.NONE
+        self.ghost_kind:  str | None     = None
+        self.ghost_slot:  int | None     = None
+        self.ghost_valid: bool           = False
+        self.ghost_pos:   tuple[int,int] = (0, 0)
+        # Pre-render ghost surfaces (SLOT_SIZE × SLOT_SIZE coloured placeholder)
+        self._ghost_surfs: dict[str, pygame.Surface] = {}
+        for _kind in BUILDING_SPECS:
+            _gs = pygame.Surface((SLOT_SIZE, SLOT_SIZE), pygame.SRCALPHA)
+            _gs.fill(
+                (100, 180, 255, 120) if _kind == "barracks" else (255, 160, 60, 120)
+            )
+            self._ghost_surfs[_kind] = _gs
 
         def spawn_vfx(pos: tuple[float, float]) -> None:
             self.vfx_list.append(
@@ -578,6 +720,28 @@ class GameLoop:
             "slot_buildings": len(self.slot_buildings),
         })
 
+    # ── Slot finder ───────────────────────────────────────────────────────────
+    def _find_nearest_slot(
+        self, wx: float, wy: float
+    ) -> tuple[int | None, bool]:
+        """
+        Return (slot_idx, is_valid) for the ALL_SLOTS entry nearest to
+        world-pos (wx, wy) within SNAP_RADIUS.  is_valid=True means empty.
+        Returns (None, False) if no slot is close enough.
+        """
+        best_idx  = None
+        best_dist = float("inf")
+        for idx, (sx, sy) in enumerate(ALL_SLOTS):
+            cx = sx + SLOT_SIZE // 2
+            cy = sy + SLOT_SIZE // 2
+            d  = math.hypot(wx - cx, wy - cy)
+            if d < best_dist:
+                best_dist = d
+                best_idx  = idx
+        if best_dist > SNAP_RADIUS or best_idx is None:
+            return None, False
+        return best_idx, (best_idx not in self._occupied_slots)
+
     # ── Main loop ─────────────────────────────────────────────────────────────
     def run(self) -> None:
         lmb_down     = False
@@ -596,10 +760,23 @@ class GameLoop:
 
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
-                        running = False
+                        # ESC cancels build/demolish mode first; second press quits
+                        if self.build_state != BuildState.NONE:
+                            self.build_state = BuildState.NONE
+                            self.ghost_kind  = None
+                            self.ghost_slot  = None
+                        else:
+                            running = False
                     elif event.key == pygame.K_r:
                         self._init_scene()
                     elif event.key == pygame.K_d:
+                        # D key → toggle DEMOLISHING mode
+                        if self.build_state == BuildState.DEMOLISHING:
+                            self.build_state = BuildState.NONE
+                        else:
+                            self.build_state = BuildState.DEMOLISHING
+                            self.ghost_kind  = None
+                    elif event.key == pygame.K_F1:
                         self.debug_mode = not self.debug_mode
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -607,26 +784,113 @@ class GameLoop:
                     if event.button == 1:
                         lmb_down     = True
                         lmb_down_pos = (mx, my)
-                        self.camera.on_mouse_down(mx)
+
+                        # ── Card click detection ──────────────────────────────
+                        card_clicked = False
+                        for i, rect in enumerate(CARD_RECTS):
+                            if rect.collidepoint(mx, my):
+                                card_clicked = True
+                                kind = CARD_KINDS[i]
+                                if kind is None:
+                                    # Demolish toggle button
+                                    if self.build_state == BuildState.DEMOLISHING:
+                                        self.build_state = BuildState.NONE
+                                    else:
+                                        self.build_state = BuildState.DEMOLISHING
+                                        self.ghost_kind  = None
+                                else:
+                                    # Building card — enter CONSTRUCTING if affordable
+                                    cost = CARD_COSTS[kind]
+                                    if self.res.minerals >= cost:
+                                        self.build_state = BuildState.CONSTRUCTING
+                                        self.ghost_kind  = kind
+                                        self.ghost_pos   = (mx, my)
+                                        self.ghost_slot  = None
+                                        self.ghost_valid = False
+                                break
+
+                        if not card_clicked:
+                            if self.build_state == BuildState.NONE:
+                                # Normal camera drag start
+                                self.camera.on_mouse_down(mx)
+
                     elif event.button == 3:
-                        # RMB: move a test unit (debug convenience)
-                        wx, wy = self.camera.screen_to_world(mx, my)
-                        if self.units:
-                            u = self.units[0]
-                            u.waypoints.clear()
-                            u.move_to((wx, wy))
+                        # RMB: cancel build/demolish; or move debug unit
+                        if self.build_state != BuildState.NONE:
+                            self.build_state = BuildState.NONE
+                            self.ghost_kind  = None
+                            self.ghost_slot  = None
+                        else:
+                            wx, wy = self.camera.screen_to_world(mx, my)
+                            if self.units:
+                                u = self.units[0]
+                                u.waypoints.clear()
+                                u.move_to((wx, wy))
 
                 elif event.type == pygame.MOUSEMOTION:
-                    if lmb_down:
-                        self.camera.on_mouse_move(event.pos[0])
+                    mx, my = event.pos
+                    if self.build_state == BuildState.CONSTRUCTING:
+                        # Update ghost position and snap to nearest slot
+                        self.ghost_pos = (mx, my)
+                        wx, wy = self.camera.screen_to_world(mx, my)
+                        self.ghost_slot, self.ghost_valid = self._find_nearest_slot(wx, wy)
+                    elif self.build_state == BuildState.NONE and lmb_down:
+                        self.camera.on_mouse_move(mx)
 
                 elif event.type == pygame.MOUSEBUTTONUP:
                     if event.button == 1:
                         mx, my = event.pos
-                        if not self.camera.was_dragged(mx):
+
+                        if self.build_state == BuildState.CONSTRUCTING:
+                            # Place building if snapping to a valid empty slot
+                            if self.ghost_slot is not None and self.ghost_valid:
+                                cost = CARD_COSTS[self.ghost_kind]
+                                if self.res.spend(cost):
+                                    self._place_building(
+                                        self.ghost_slot, self.ghost_kind, team=0
+                                    )
+                                    print(
+                                        f"[Build] placed {self.ghost_kind} "
+                                        f"at slot {self.ghost_slot}  "
+                                        f"minerals={self.res.minerals}"
+                                    )
+                            # Always exit constructing mode on mouse-up
+                            self.build_state = BuildState.NONE
+                            self.ghost_kind  = None
+                            self.ghost_slot  = None
+
+                        elif self.build_state == BuildState.DEMOLISHING:
+                            # Find slot building under cursor and demolish it
                             wx, wy = self.camera.screen_to_world(mx, my)
-                            self.spawn_vfx((wx, wy))
-                        self.camera.on_mouse_up()
+                            slot_idx, _ = self._find_nearest_slot(wx, wy)
+                            if slot_idx is not None and slot_idx in self._occupied_slots:
+                                # Find the Building sprite at that slot
+                                sx, sy = ALL_SLOTS[slot_idx]
+                                cx = sx + SLOT_SIZE // 2
+                                cy = sy + SLOT_SIZE // 2
+                                for b in self.slot_buildings:
+                                    if (
+                                        not b.is_dead
+                                        and not b.is_hq
+                                        and abs(b.pos[0] - cx) < SLOT_SIZE // 2 + 4
+                                        and abs(b.pos[1] - cy) < SLOT_SIZE // 2 + 4
+                                    ):
+                                        b.demolish(self.res, self.spawn_vfx)
+                                        self._occupied_slots.discard(slot_idx)
+                                        print(
+                                            f"[Demolish] slot {slot_idx}  "
+                                            f"minerals={self.res.minerals}"
+                                        )
+                                        break
+                            # Stay in DEMOLISHING so player can keep clicking
+
+                        else:
+                            # Normal mode: click without drag spawns VFX
+                            if not self.camera.was_dragged(mx):
+                                wx, wy = self.camera.screen_to_world(mx, my)
+                                self.spawn_vfx((wx, wy))
+                            self.camera.on_mouse_up()
+
                         lmb_down = False
 
             # ── Game logic ────────────────────────────────────────────────────
@@ -723,6 +987,23 @@ class GameLoop:
                 slot_buildings=self.slot_buildings,
             )
             draw_unit_cards(self.screen, self.font, self.units)
+
+            # ── Phase 3: build cards + ghost ─────────────────────────────────
+            draw_build_cards(
+                self.screen, self.font,
+                self.res.minerals,
+                self.build_state,
+                self.ghost_kind,
+            )
+            if self.build_state == BuildState.CONSTRUCTING and self.ghost_kind:
+                draw_ghost(
+                    self.screen, self.font,
+                    ghost_surf   = self._ghost_surfs.get(self.ghost_kind),
+                    ghost_screen = self.ghost_pos,
+                    snap_slot    = self.ghost_slot,
+                    snap_valid   = self.ghost_valid,
+                    cam_x        = cam_x,
+                )
 
             if self.game_result:
                 draw_result_overlay(self.screen, self.game_result)

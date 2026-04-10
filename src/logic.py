@@ -27,10 +27,27 @@ Building auto-spawn table (BUILDING_SPECS)
 """
 
 from __future__ import annotations
+from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.sprite import Building   # avoid circular import at runtime
+
+
+# ── BuildState Enum ───────────────────────────────────────────────────────────
+class BuildState(Enum):
+    """
+    Tracks what the player's cursor/build system is currently doing.
+
+    NONE          : default — camera drag and normal game interaction are active.
+    CONSTRUCTING  : player has picked up a building card and is dragging a ghost
+                    sprite; camera scrolling is suppressed until drop/cancel.
+    DEMOLISHING   : demolish mode is toggled ON; left-clicking an existing slot
+                    building triggers Building.demolish() and refunds 60 % cost.
+    """
+    NONE         = auto()
+    CONSTRUCTING = auto()
+    DEMOLISHING  = auto()
 
 # ── Income constants ──────────────────────────────────────────────────────────
 INCOME_CYCLE_FRAMES: int = 300    # 5 s @ 60 fps
@@ -143,6 +160,22 @@ class ResourceManager:
             self.minerals -= amount
             return True
         return False
+
+    def refund(self, amount: int) -> None:
+        """
+        Credit minerals back to the player (used by Building.demolish).
+
+        Refund formula: caller passes int(cost * 0.6) — i.e. 60 % of the
+        building's original cost.  This method simply adds the amount with
+        no cap so the player cannot 'lose' minerals on a demolish.
+
+        Examples
+        --------
+        barracks (cost 100)  → refund(60)   → minerals += 60
+        refinery (cost 200)  → refund(120)  → minerals += 120
+        """
+        self.minerals += amount
+        print(f"[Economy] Refund +{amount}  →  {self.minerals} minerals")
 
     def __repr__(self) -> str:
         alive = sum(1 for b in self._slot_buildings if not b.is_dead)
