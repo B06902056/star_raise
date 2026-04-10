@@ -1,23 +1,26 @@
 """
-server.py — Star Raise FastAPI Backend  (v4)
+server.py — Star Raise FastAPI Backend  (v5: Auto-Spawn Economy)
 
-端點
-----
-GET /              → 健康確認
-GET /api/game_state → 當前遊戲狀態快照（礦石、單位數、建築 HP）
-GET /api/units     → 所有單位列表（含 HP / 狀態）
-GET /api/buildings → 所有建築狀態
+Endpoints
+---------
+GET /                → health check
+GET /api/game_state  → full game snapshot (minerals, income breakdown, units, buildings)
+GET /api/units       → unit list only (lightweight polling)
+GET /api/buildings   → building status (HQs + slot buildings)
 
-部署
-----
-本地 : uvicorn server:app --reload --port 8000
-Zeabur/Render: Procfile → web: uvicorn server:app --host 0.0.0.0 --port $PORT
+Phase 2 notes on /api/game_state
+----------------------------------
+income_base   : flat 10 minerals / 5 s, always present
+income_bonus  : Σ b.income_bonus for every alive slot building
+                  barracks → +5 / cycle  (5% of cost 100)
+                  refinery → +10 / cycle (5% of cost 200)
+income_rate   : income_base + income_bonus  (total per 5 s cycle)
 
-遊戲執行緒安全
---------------
-遊戲主迴圈（pygame, main thread）每幀呼叫 src.shared.write()，
-本模組的所有 handler 透過 src.shared.read() 取得快照，
-不直接存取任何 pygame 物件，完全無競態風險。
+buildings[]   : now includes slot buildings as well as HQs
+  is_hq           : true = victory-condition target (not auto-spawning)
+  lane            : "top" | "bottom" | "none"
+  income_bonus    : per-cycle mineral contribution (0 for HQs)
+  spawn_progress  : 0.0–1.0, fraction toward next unit spawn (0 for HQs)
 """
 
 from __future__ import annotations
@@ -25,7 +28,6 @@ from __future__ import annotations
 import os
 import sys
 
-# 確保 src/ 在路徑中（uvicorn 直接啟動時工作目錄可能不同）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI
@@ -34,49 +36,47 @@ from fastapi.responses import JSONResponse
 
 from src.shared import read as read_state
 
-# ── FastAPI App ───────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Star Raise Game API",
-    description="即時遊戲狀態 API，供前端 Dashboard 或 AI 合作夥伴呼叫",
-    version="0.4.0",
+    description="Real-time game state API — Phase 2: Auto-Spawn & Economy-Building Linkage",
+    version="0.5.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # 開發階段開放，部署時限縮
+    allow_origins=["*"],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
 
 
-# ── 端點 ─────────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/", tags=["health"])
 def root() -> dict:
-    """健康確認端點，Zeabur 健康檢查用。"""
-    return {"status": "ok", "service": "star_raise_api", "version": "0.4.0"}
+    return {"status": "ok", "service": "star_raise_api", "version": "0.5.0"}
 
 
 @app.get("/api/game_state", tags=["game"])
 def game_state() -> JSONResponse:
     """
-    回傳完整遊戲狀態快照。
+    Full game snapshot.
 
-    欄位說明
-    --------
-    frame        : 當前遊戲幀數
-    game_result  : null | "VICTORY" | "DEFEAT"
-    minerals     : 玩家當前礦石數
-    income_rate  : 每收入週期獲得的礦石數
-    unit_count   : 場上存活單位總數
-    units        : 所有單位的詳細資訊列表
-    buildings    : 所有建築的詳細資訊列表
+    Key fields (Phase 2)
+    --------------------
+    minerals       : player's current mineral balance
+    income_base    : flat base income (always 10)
+    income_bonus   : bonus from placed buildings (barracks +5, refinery +10 each)
+    income_rate    : income_base + income_bonus (total per 5 s cycle)
+    buildings      : list of all buildings with lane, income_bonus, spawn_progress
+    slot_buildings : total count of placed slot buildings
     """
     return JSONResponse(content=read_state())
 
 
 @app.get("/api/units", tags=["game"])
 def units() -> JSONResponse:
-    """只回傳單位列表（輕量版，適合高頻輪詢）。"""
+    """Unit list — lightweight for high-frequency polling."""
     state = read_state()
     return JSONResponse(content={
         "frame":      state["frame"],
@@ -87,16 +87,21 @@ def units() -> JSONResponse:
 
 @app.get("/api/buildings", tags=["game"])
 def buildings() -> JSONResponse:
-    """回傳建築 HP 狀態（用於前端基地血條）。"""
+    """
+    Building HP + slot status.
+    Includes HQs (is_hq=true) and all slot buildings (is_hq=false).
+    """
     state = read_state()
     return JSONResponse(content={
-        "frame":       state["frame"],
-        "game_result": state["game_result"],
-        "buildings":   state["buildings"],
+        "frame":          state["frame"],
+        "game_result":    state["game_result"],
+        "slot_buildings": state["slot_buildings"],
+        "income_rate":    state["income_rate"],
+        "buildings":      state["buildings"],
     })
 
 
-# ── 本地直接執行 ──────────────────────────────────────────────────────────────
+# ── Direct run ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))

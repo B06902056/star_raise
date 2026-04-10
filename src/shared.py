@@ -1,42 +1,47 @@
 """
-shared.py — Star Raise Game  (v4: API Integration)
-執行緒安全的遊戲狀態快照，供 FastAPI 讀取。
+shared.py — Star Raise  (v5: Auto-Spawn Economy)
+Thread-safe game-state snapshot for FastAPI.
 
-GameLoop（主執行緒）每幀呼叫 write()，
-uvicorn（背景執行緒）的 API handler 呼叫 read()。
-CPython GIL 已提供基本安全，threading.Lock 確保跨平台一致。
+GameLoop (main thread) writes every frame via write().
+uvicorn (daemon thread) reads via read() — no pygame objects involved.
 """
 
 import threading
 from typing import Any
 
-_lock: threading.Lock = threading.Lock()
+_lock:  threading.Lock = threading.Lock()
 
-# 初始快照（欄位必須與 GameLoop 每幀寫入的 key 完全對應）
+# Initial snapshot — keys must match what GameLoop._push_state() writes
 _state: dict[str, Any] = {
     "frame":        0,
-    "game_result":  None,          # None | "VICTORY" | "DEFEAT"
+    "game_result":  None,           # None | "VICTORY" | "DEFEAT"
 
-    # 玩家資源
-    "minerals":     0,
-    "income_rate":  0,
+    # Economy (Phase 2: income is now split into base + building bonus)
+    "minerals":      0,
+    "income_base":   10,            # always BASE_INCOME = 10
+    "income_bonus":  0,             # Σ b.income_bonus from alive slot buildings
+    "income_rate":   10,            # income_base + income_bonus
 
-    # 單位
-    "unit_count":   0,
-    "units": [],                   # [{kind, team, hp, max_hp, state}]
+    # Units
+    "unit_count":    0,
+    "units":         [],            # [{kind, team, hp, max_hp, state, pos}]
 
-    # 建築
-    "buildings": [],               # [{kind, team, hp, max_hp, is_dead}]
+    # Buildings (HQs + slot buildings)
+    "buildings":     [],            # [{kind, team, hp, max_hp, is_dead,
+                                    #   is_hq, lane, income_bonus, spawn_progress}]
+
+    # Slot summary
+    "slot_buildings": 0,            # count of placed slot buildings
 }
 
 
 def write(data: dict[str, Any]) -> None:
-    """GameLoop 每幀呼叫，覆寫對應欄位。"""
+    """GameLoop calls this every frame to update the snapshot."""
     with _lock:
         _state.update(data)
 
 
 def read() -> dict[str, Any]:
-    """API handler 呼叫，回傳快照深拷貝。"""
+    """API handler calls this; returns a shallow copy of the current snapshot."""
     with _lock:
         return dict(_state)

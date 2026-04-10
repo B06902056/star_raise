@@ -1,42 +1,46 @@
 """
-sprite.py — Star Raise Game  (v3: Economy & Spawning)
-定義 Sprite 基底類別、Building（含生產介面）、Unit（含戰鬥 FSM）、VFXSprite。
+sprite.py — Star Raise  (v5: Auto-Spawn Economy)
 
-Unit 狀態機
------------
-  march  ──scan_hit──▶  combat  ──enemy_dead──▶  march
-                          │
-                       hp <= 0
-                          ▼
-                         dead
+Phase 2 changes
+---------------
+Building
+  - queue / ProductionQueue  : REMOVED
+  - gives_income             : REMOVED
+  - produce()                : REMOVED
+  + lane        : "top" | "bottom" | "none"  (slot lane; "none" = HQ)
+  + is_hq       : True for Player/Enemy HQ (victory-condition targets)
+  + spawn_timer : counts up toward spawn_rate_frames
+  + unit_type   : from BUILDING_SPECS (what this building auto-spawns)
+  + income_bonus: flat per-cycle mineral bonus (= floor(cost × 5%))
+  + update()    : ticks timer; returns (unit_type, spawn_pos, lane) or None
+  + _draw_spawn_bar() : progress bar toward next spawn
 
-Building 角色
--------------
-  "barracks"  → produce(unit_type) 委派給 ProductionQueue
-  "refinery"  → 建立時通知 ResourceManager.register_refinery()
+Unit / GameSprite / VFXSprite — unchanged from v4
 """
 
 from __future__ import annotations
+
 import math
 import pygame
 from typing import Optional, Callable, TYPE_CHECKING
+
 from src.asset_manager import AssetManager
+from src.logic        import BUILDING_SPECS
 
 if TYPE_CHECKING:
-    from src.logic import ResourceManager, ProductionQueue
+    pass   # no circular-import risk now
 
-# VFX 回調型別: (pos: tuple[float, float]) -> None
 VFXCallback = Callable[[tuple[float, float]], None]
 
 
-# ── 單位數值規格表 ─────────────────────────────────────────────────────────────
+# ── Unit stat table ───────────────────────────────────────────────────────────
 UNIT_STATS: dict[str, dict] = {
     "marine": {
         "scale":       (32, 32),
         "hp":          100,
         "speed":       1.8,
         "atk_dmg":     15,
-        "atk_cd":      60,      # frames (60fps → 1 秒 1 擊)
+        "atk_cd":      60,
         "scan_range":  150,
         "col_radius":  16,
     },
@@ -45,24 +49,29 @@ UNIT_STATS: dict[str, dict] = {
         "hp":          250,
         "speed":       1.1,
         "atk_dmg":     40,
-        "atk_cd":      90,      # 1.5 秒 1 擊
+        "atk_cd":      90,
         "scan_range":  180,
         "col_radius":  24,
     },
 }
 
+# Lane indicator colours (used in draw)
+_LANE_COLORS = {
+    "top":    (80,  160, 255),
+    "bottom": (255, 160,  60),
+    "none":   (160, 160, 160),
+}
 
-# ── 基底 Sprite ───────────────────────────────────────────────────────────────
+
+# ── Base Sprite ───────────────────────────────────────────────────────────────
 class GameSprite:
     """
-    所有遊戲物件的基底類別。
+    Base class for all game objects.
 
-    Attributes
-    ----------
-    pos              : 世界座標 [x, y]，中心點
-    angle            : 面向角度（度），0 = 朝右，逆時針為正
-    surface          : 當前 pygame.Surface（已套用旋轉）
-    collision_radius : 圓形碰撞半徑（子類別覆寫）
+    pos              : world-space centre [x, y]
+    angle            : facing angle in degrees (0 = right, CCW positive)
+    surface          : current pygame.Surface (post-rotation)
+    collision_radius : circular collision radius (overridden by subclasses)
     """
 
     collision_radius: int = 16
@@ -76,12 +85,12 @@ class GameSprite:
     ) -> None:
         self.asset_key     = asset_key
         self.manager       = manager
-        self.pos           = list(pos)       # [x, y]
+        self.pos           = list(pos)
         self.angle         = 0.0
         self._base_surface = manager.get(asset_key, scale=scale)
         self.surface       = self._base_surface
 
-    # ── 旋轉 ──────────────────────────────────────────────────────────────────
+    # ── Rotation ──────────────────────────────────────────────────────────────
     def rotate_to(self, target: tuple[float, float]) -> None:
         dx = target[0] - self.pos[0]
         dy = target[1] - self.pos[1]
@@ -95,7 +104,7 @@ class GameSprite:
     def _apply_rotation(self) -> None:
         self.surface = pygame.transform.rotate(self._base_surface, self.angle)
 
-    # ── 渲染 ──────────────────────────────────────────────────────────────────
+    # ── Rendering ─────────────────────────────────────────────────────────────
     def draw(self, screen: pygame.Surface, camera_offset: tuple[int, int] = (0, 0)) -> None:
         rect = self.surface.get_rect(
             center=(
@@ -106,19 +115,15 @@ class GameSprite:
         screen.blit(self.surface, rect)
 
     def draw_debug(self, screen: pygame.Surface, camera_offset: tuple[int, int] = (0, 0)) -> None:
-        """繪製碰撞圓 + 掃描範圍圓（開發用）。"""
         cx = int(self.pos[0]) - camera_offset[0]
         cy = int(self.pos[1]) - camera_offset[1]
-        # 碰撞圓
         pygame.draw.circle(screen, (0, 255, 0), (cx, cy), self.collision_radius, 1)
-        # 中心點
         pygame.draw.circle(screen, (255, 0, 0), (cx, cy), 3)
 
     @property
     def rect(self) -> pygame.Rect:
         return self.surface.get_rect(center=(int(self.pos[0]), int(self.pos[1])))
 
-    # ── 距離工具 ──────────────────────────────────────────────────────────────
     def dist_to(self, other: "GameSprite") -> float:
         return math.hypot(
             self.pos[0] - other.pos[0],
@@ -126,77 +131,122 @@ class GameSprite:
         )
 
 
-# ── 建築 ─────────────────────────────────────────────────────────────────────
+# ── Building ──────────────────────────────────────────────────────────────────
 class Building(GameSprite):
     """
-    靜態建築物件（不移動、可被攻擊）。
+    Static building. Two subtypes:
+
+    HQ building  (is_hq=True, lane="none")
+        - Victory-condition target; never auto-spawns.
+        - Placed at world edges by GameLoop.
+
+    Slot building (is_hq=False, lane="top"|"bottom")
+        - Placed inside the player's 4×4 grid slots.
+        - Auto-spawns its unit_type when spawn_timer reaches spawn_rate_frames.
+        - Contributes income_bonus minerals to each income cycle while alive.
 
     Parameters
     ----------
     kind  : "barracks" | "refinery"
-    hp    : 血量
-    team  : 0 = 玩家, 1 = 敵方
+    pos   : world-space centre
+    hp    : starting hit-points
+    team  : 0 = player, 1 = enemy
+    lane  : "top" | "bottom" | "none"
+    is_hq : True → HQ building (no auto-spawn, no income bonus)
     """
 
     collision_radius = 48
 
-    NAMES = {"barracks": "兵營", "refinery": "採礦場"}
-
-    # 不同建築種類的出兵點偏移（相對建築中心）
-    SPAWN_OFFSET: dict[str, tuple[int, int]] = {
-        "barracks": (80, 0),    # 兵營右側生成
-        "refinery": (80, 0),
-    }
+    # Spawn-point offset for HQ buildings (unit appears beside HQ)
+    _HQ_SPAWN_OFFSET = 100
 
     def __init__(
         self,
-        kind: str,
+        kind:   str,
         manager: AssetManager,
-        pos: tuple[float, float],
-        hp: int = 500,
-        team: int = 0,
+        pos:    tuple[float, float],
+        hp:     int  = 500,
+        team:   int  = 0,
+        lane:   str  = "none",
+        is_hq:  bool = False,
     ) -> None:
         super().__init__(kind, manager, pos, scale=(96, 96))
-        self.kind      = kind
-        self.hp        = hp
-        self.max_hp    = hp
-        self.team      = team
-        self.is_dead   = False
+        self.kind   = kind
+        self.hp     = hp
+        self.max_hp = hp
+        self.team   = team
+        self.is_dead = False
+        self.is_hq   = is_hq
+        self.lane    = lane   # "top" | "bottom" | "none"
 
-        # 生產佇列（由 main.py 外部注入，Barracks 專用）
-        self.queue: Optional[ProductionQueue] = None
+        # ── Auto-spawn state (slot buildings only) ────────────────────────────
+        spec = BUILDING_SPECS.get(kind, {})
+        self.unit_type:         str = spec.get("unit_type", "marine")
+        self.spawn_rate_frames: int = spec.get("spawn_rate_frames", 480)
+        self._cost:             int = spec.get("cost", 0)
+        self._income_bonus:     int = spec.get("income_bonus", 0)
+        self.spawn_timer:       int = 0   # counts up each frame
 
-        # 被動收入角色（Refinery 設 True，由 main.py 搭配 ResourceManager 使用）
-        self.gives_income: bool = (kind == "refinery")
+    # ── Properties ────────────────────────────────────────────────────────────
+    @property
+    def income_bonus(self) -> int:
+        """
+        Flat minerals added to income_per_cycle while this building is alive.
+        0 for HQ buildings.
+        """
+        return 0 if self.is_hq else self._income_bonus
 
-    # ── 出兵點屬性 ────────────────────────────────────────────────────────────
+    @property
+    def spawn_progress(self) -> float:
+        """0.0 – 1.0 progress toward next unit spawn."""
+        if self.spawn_rate_frames == 0:
+            return 0.0
+        return self.spawn_timer / self.spawn_rate_frames
+
     @property
     def spawn_point(self) -> tuple[float, float]:
         """
-        單位生產完成後的出現座標。
-        team=0（玩家）右偏，team=1（敵方）左偏。
+        World position where a newly spawned unit should appear.
+        HQ: beside the building (team-direction offset).
+        Slot: exactly at building centre (main.py routes via lane waypoints).
         """
-        ox, oy = self.SPAWN_OFFSET.get(self.kind, (80, 0))
-        if self.team == 1:
-            ox = -ox   # 敵方建築向左生成
-        return (self.pos[0] + ox, self.pos[1] + oy)
+        if self.is_hq:
+            ox = self._HQ_SPAWN_OFFSET if self.team == 0 else -self._HQ_SPAWN_OFFSET
+            return (self.pos[0] + ox, self.pos[1])
+        return (float(self.pos[0]), float(self.pos[1]))
 
-    # ── 生產介面 ──────────────────────────────────────────────────────────────
-    def produce(self, unit_type: str, resource_mgr: ResourceManager) -> bool:
+    # ── Per-frame update ──────────────────────────────────────────────────────
+    def update(self) -> Optional[tuple[str, tuple[float, float], str]]:
         """
-        委派生產任務給已注入的 ProductionQueue。
-        回傳 True 表示成功入隊；若無佇列或資源不足則 False。
-        """
-        if self.is_dead:
-            print(f"[Building] ⚠️  建築已摧毀，無法生產")
-            return False
-        if self.queue is None:
-            print(f"[Building] ⚠️  {self.kind} 沒有生產佇列")
-            return False
-        return self.queue.enqueue(unit_type, resource_mgr)
+        Advance spawn timer by one frame.
 
-    # ── 受傷 / 死亡 ───────────────────────────────────────────────────────────
-    def take_damage(self, amount: int, vfx_callback: Optional[VFXCallback] = None) -> None:
+        Returns
+        -------
+        (unit_type, world_spawn_pos, lane)  when a unit is ready to spawn.
+        None                                otherwise, or for HQ buildings.
+
+        The caller (GameLoop) is responsible for creating the Unit sprite
+        and setting lane-appropriate waypoints.
+        """
+        if self.is_dead or self.is_hq or self.spawn_rate_frames == 0:
+            return None
+
+        self.spawn_timer += 1
+        if self.spawn_timer >= self.spawn_rate_frames:
+            self.spawn_timer = 0
+            print(
+                f"[Building] {self.kind}({self.lane}) spawns {self.unit_type} "
+                f"at ({self.pos[0]:.0f}, {self.pos[1]:.0f})"
+            )
+            return (self.unit_type, self.spawn_point, self.lane)
+        return None
+
+    # ── Damage / death ────────────────────────────────────────────────────────
+    def take_damage(
+        self,
+        amount: int,
+        vfx_callback: Optional[VFXCallback] = None,
+    ) -> None:
         if self.is_dead:
             return
         self.hp = max(0, self.hp - amount)
@@ -207,119 +257,106 @@ class Building(GameSprite):
         self.is_dead = True
         if vfx_callback:
             vfx_callback(tuple(self.pos))
-        print(f"[Building] 💀 {self.kind} (team={self.team}) 被摧毀")
+        print(f"[Building] {self.kind} (team={self.team}) destroyed")
 
-    # ── 渲染 ──────────────────────────────────────────────────────────────────
+    # ── Rendering ─────────────────────────────────────────────────────────────
     def draw(self, screen: pygame.Surface, camera_offset: tuple[int, int] = (0, 0)) -> None:
         if self.is_dead:
             return
         super().draw(screen, camera_offset)
         self._draw_hp_bar(screen, camera_offset)
-        # 正在生產時顯示進度弧
-        if self.queue and self.queue.is_busy:
-            self._draw_production_bar(screen, camera_offset)
-        # 煉油廠標示
-        if self.gives_income:
-            self._draw_refinery_indicator(screen, camera_offset)
+        if not self.is_hq:
+            self._draw_spawn_bar(screen, camera_offset)
+            self._draw_lane_dot(screen, camera_offset)
 
-    def _draw_hp_bar(self, screen: pygame.Surface, camera_offset: tuple[int, int]) -> None:
-        cx = int(self.pos[0]) - camera_offset[0]
-        cy = int(self.pos[1]) - camera_offset[1]
+    def _draw_hp_bar(self, screen: pygame.Surface, cam: tuple[int, int]) -> None:
+        cx = int(self.pos[0]) - cam[0]
+        cy = int(self.pos[1]) - cam[1]
         bar_w, bar_h = 80, 6
         x = cx - bar_w // 2
         y = cy - self.surface.get_height() // 2 - 22
         ratio = max(0.0, self.hp / self.max_hp)
-        pygame.draw.rect(screen, (80, 0, 0),    (x, y, bar_w, bar_h))
-        pygame.draw.rect(screen, (0, 200, 60),  (x, y, int(bar_w * ratio), bar_h))
-        pygame.draw.rect(screen, (200, 200, 200),(x, y, bar_w, bar_h), 1)
+        pygame.draw.rect(screen, (80,  0,   0),   (x, y, bar_w, bar_h))
+        pygame.draw.rect(screen, (0,  200,  60),  (x, y, int(bar_w * ratio), bar_h))
+        pygame.draw.rect(screen, (200, 200, 200), (x, y, bar_w, bar_h), 1)
 
-    def _draw_production_bar(self, screen: pygame.Surface, camera_offset: tuple[int, int]) -> None:
-        """在建築下方繪製生產進度條。"""
-        cx = int(self.pos[0]) - camera_offset[0]
-        cy = int(self.pos[1]) - camera_offset[1]
-        bar_w, bar_h = 80, 5
+    def _draw_spawn_bar(self, screen: pygame.Surface, cam: tuple[int, int]) -> None:
+        """
+        Cyan progress bar below the building showing time until next spawn.
+        Fills left→right; resets to 0 on each spawn.
+        """
+        cx = int(self.pos[0]) - cam[0]
+        cy = int(self.pos[1]) - cam[1]
+        bar_w, bar_h = 64, 5
         x = cx - bar_w // 2
-        y = cy + self.surface.get_height() // 2 + 4
-        progress = self.queue.current_progress if self.queue else 0.0
-        pygame.draw.rect(screen, (40, 40, 80),  (x, y, bar_w, bar_h))
-        pygame.draw.rect(screen, (80, 160, 255),(x, y, int(bar_w * progress), bar_h))
-        pygame.draw.rect(screen, (120, 120, 180),(x, y, bar_w, bar_h), 1)
+        y = cy + self.surface.get_height() // 2 + 6
+        progress = self.spawn_progress
+        pygame.draw.rect(screen, (20,  40,  70), (x, y, bar_w, bar_h))
+        pygame.draw.rect(screen, (60, 200, 255), (x, y, int(bar_w * progress), bar_h))
+        pygame.draw.rect(screen, (80, 140, 200), (x, y, bar_w, bar_h), 1)
 
-    def _draw_refinery_indicator(self, screen: pygame.Surface, camera_offset: tuple[int, int]) -> None:
-        """煉油廠：右上角金色閃爍圓點。"""
-        cx = int(self.pos[0]) - camera_offset[0]
-        cy = int(self.pos[1]) - camera_offset[1]
-        pygame.draw.circle(screen, (255, 200, 30), (cx + 38, cy - 38), 7)
-        pygame.draw.circle(screen, (255, 255, 180),(cx + 38, cy - 38), 4)
+    def _draw_lane_dot(self, screen: pygame.Surface, cam: tuple[int, int]) -> None:
+        """Small coloured dot in the top-right corner indicating which lane."""
+        cx = int(self.pos[0]) - cam[0]
+        cy = int(self.pos[1]) - cam[1]
+        color = _LANE_COLORS.get(self.lane, (200, 200, 200))
+        pygame.draw.circle(screen, color, (cx + 38, cy - 38), 6)
+        pygame.draw.circle(screen, (255, 255, 255), (cx + 38, cy - 38), 6, 1)
 
 
-# ── 單位 ─────────────────────────────────────────────────────────────────────
+# ── Unit ──────────────────────────────────────────────────────────────────────
 class Unit(GameSprite):
     """
-    可移動的兵種單位，含戰鬥 FSM。
+    Mobile combat unit with a 3-state FSM: march → combat → assault (→ dead).
 
-    狀態
-    ----
-    "march"  : 依 waypoints 前進
-    "combat" : 停止移動，對最近敵人持續攻擊
-    "dead"   : 已陣亡，等待 BattleManager 移除
+    States
+    ------
+    "march"   : following waypoints toward enemy base
+    "combat"  : stopped, attacking nearest enemy unit in scan_range
+    "assault" : waypoints exhausted, attacking nearest enemy HQ building
+    "dead"    : removed by BattleManager next cleanup pass
 
     Parameters
     ----------
     kind        : "marine" | "tank"
-    speed       : 每幀移動像素（可覆寫規格表）
-    hp          : 血量（可覆寫規格表）
-    team        : 0 = 玩家, 1 = 敵方
-    scan_range  : 偵測敵人的圓形半徑（px）
-    atk_cd      : 攻擊冷卻（幀數）
-    atk_dmg     : 單次傷害值
+    speed / hp  : override UNIT_STATS defaults if provided
+    team        : 0 = player, 1 = enemy
     """
 
     def __init__(
         self,
-        kind: str,
-        manager: AssetManager,
-        pos: tuple[float, float],
-        speed: Optional[float]     = None,
-        hp: Optional[int]          = None,
-        team: int                  = 0,
-        scan_range: Optional[float]= None,
-        atk_cd: Optional[int]      = None,
-        atk_dmg: Optional[int]     = None,
+        kind:       str,
+        manager:    AssetManager,
+        pos:        tuple[float, float],
+        speed:      Optional[float] = None,
+        hp:         Optional[int]   = None,
+        team:       int             = 0,
+        scan_range: Optional[float] = None,
+        atk_cd:     Optional[int]   = None,
+        atk_dmg:    Optional[int]   = None,
     ) -> None:
         stats = UNIT_STATS.get(kind, UNIT_STATS["marine"])
-        scale = stats["scale"]
-        super().__init__(kind, manager, pos, scale=scale)
+        super().__init__(kind, manager, pos, scale=stats["scale"])
 
-        # 數值（可被呼叫端覆寫，否則用規格表預設）
-        self.kind        = kind
-        self.hp          = hp        if hp        is not None else stats["hp"]
-        self.max_hp      = self.hp
-        self.speed       = speed     if speed     is not None else stats["speed"]
-        self.atk_dmg     = atk_dmg   if atk_dmg   is not None else stats["atk_dmg"]
-        self.atk_cd      = atk_cd    if atk_cd    is not None else stats["atk_cd"]
-        self.scan_range  = scan_range if scan_range is not None else stats["scan_range"]
+        self.kind            = kind
+        self.hp              = hp        if hp        is not None else stats["hp"]
+        self.max_hp          = self.hp
+        self.speed           = speed     if speed     is not None else stats["speed"]
+        self.atk_dmg         = atk_dmg   if atk_dmg   is not None else stats["atk_dmg"]
+        self.atk_cd          = atk_cd    if atk_cd    is not None else stats["atk_cd"]
+        self.scan_range      = scan_range if scan_range is not None else stats["scan_range"]
         self.collision_radius = stats["col_radius"]
-        self.team        = team
+        self.team            = team
 
-        # FSM
-        self.state: str  = "march"
-        self.is_dead     = False
-
-        # 移動
-        self.target: Optional[list[float]]         = None
+        self.state:   str               = "march"
+        self.is_dead: bool              = False
+        self.target:  Optional[list[float]]        = None
         self.waypoints: list[tuple[float, float]]  = []
-
-        # 攻擊冷卻計時器（從 0 開始，避免開場瞬間攻擊）
-        self.atk_timer: int = 0
-
-        # 當前鎖定目標（combat 狀態用）
-        self._locked_enemy: Optional["Unit"] = None
-
-        # 基地攻擊：鎖定的敵方建築
+        self.atk_timer: int             = 0
+        self._locked_enemy:    Optional["Unit"]     = None
         self._target_building: Optional["Building"] = None
 
-    # ── 移動介面 ──────────────────────────────────────────────────────────────
+    # ── Movement ──────────────────────────────────────────────────────────────
     def move_to(self, target: tuple[float, float]) -> None:
         self.target = list(target)
         self.rotate_to(target)
@@ -329,43 +366,43 @@ class Unit(GameSprite):
         if self.waypoints:
             self.move_to(self.waypoints[0])
 
-    # ── 掃描 ──────────────────────────────────────────────────────────────────
+    # ── Scanning ──────────────────────────────────────────────────────────────
     def scan_for_enemies(self, all_units: list["Unit"]) -> Optional["Unit"]:
-        """
-        在 scan_range 內尋找最近的敵方存活單位。
-        等同於 pygame.sprite.spritecollide + collide_circle 的圓形掃描邏輯，
-        但這裡回傳距離最近的單一目標。
-        """
-        nearest: Optional[Unit] = None
-        nearest_dist = float("inf")
+        nearest, nearest_dist = None, float("inf")
         for u in all_units:
             if u is self or u.team == self.team or u.is_dead:
                 continue
             d = self.dist_to(u)
             if d <= self.scan_range and d < nearest_dist:
-                nearest      = u
-                nearest_dist = d
+                nearest, nearest_dist = u, d
         return nearest
 
-    # ── 攻擊 ──────────────────────────────────────────────────────────────────
+    def scan_for_buildings(
+        self, buildings: list["Building"]
+    ) -> Optional["Building"]:
+        """
+        Returns the nearest alive enemy HQ building.
+        Only targets is_hq=True buildings so slot buildings are not attacked.
+        """
+        nearest, nearest_dist = None, float("inf")
+        for b in buildings:
+            if b.team == self.team or b.is_dead or not b.is_hq:
+                continue
+            d = self.dist_to(b)
+            if d < nearest_dist:
+                nearest, nearest_dist = b, d
+        return nearest
+
+    # ── Combat ────────────────────────────────────────────────────────────────
     def attack(
         self,
         enemy: "Unit",
         vfx_callback: Optional[VFXCallback] = None,
     ) -> None:
-        """
-        若冷卻結束則對目標造成傷害，並在中間點產生爆炸特效。
-        冷卻計時器每 update() 遞增 1，達到 atk_cd 時歸零觸發。
-        """
         if self.atk_timer < self.atk_cd:
             return
-
         self.atk_timer = 0
-
-        # 傷害
         enemy.take_damage(self.atk_dmg, vfx_callback)
-
-        # 爆炸特效：在攻擊者與目標的中間點
         if vfx_callback:
             mid = (
                 (self.pos[0] + enemy.pos[0]) / 2,
@@ -373,64 +410,11 @@ class Unit(GameSprite):
             )
             vfx_callback(mid)
 
-    # ── 受傷 / 死亡 ───────────────────────────────────────────────────────────
-    def take_damage(
-        self,
-        amount: int,
-        vfx_callback: Optional[VFXCallback] = None,
-    ) -> None:
-        """扣除血量；歸零時觸發 die()。"""
-        if self.is_dead:
-            return
-        self.hp = max(0, self.hp - amount)
-        if self.hp == 0:
-            self.die(vfx_callback)
-
-    def die(self, vfx_callback: Optional[VFXCallback] = None) -> None:
-        """
-        單位死亡：
-        1. 狀態切換到 "dead"
-        2. 在自身位置產生爆炸特效
-        """
-        if self.is_dead:
-            return
-        self.is_dead = True
-        self.state   = "dead"
-        self.target  = None
-        self.waypoints.clear()
-        if vfx_callback:
-            vfx_callback(tuple(self.pos))
-        print(f"[Unit] 💀 {self.kind} (team={self.team}) 陣亡於 {self.pos}")
-
-    # ── 建築掃描 ──────────────────────────────────────────────────────────────
-    def scan_for_buildings(
-        self, buildings: list["Building"]
-    ) -> Optional["Building"]:
-        """
-        回傳距離最近的存活敵方建築（不限掃描範圍，用於 lane 終點攻城）。
-        僅在 waypoints 耗盡後啟用，確保單位先完成行軍再攻城。
-        """
-        nearest: Optional[Building] = None
-        nearest_dist = float("inf")
-        for b in buildings:
-            if b.team == self.team or b.is_dead:
-                continue
-            d = self.dist_to(b)
-            if d < nearest_dist:
-                nearest      = b
-                nearest_dist = d
-        return nearest
-
-    # ── 攻擊建築 ──────────────────────────────────────────────────────────────
     def attack_building(
         self,
         building: "Building",
         vfx_callback: Optional[VFXCallback] = None,
     ) -> None:
-        """
-        對建築施加傷害（與攻擊 Unit 共用同一冷卻計時器）。
-        單位會持續朝建築旋轉並保持在攻擊距離內停步。
-        """
         if self.atk_timer < self.atk_cd:
             return
         self.atk_timer = 0
@@ -442,45 +426,51 @@ class Unit(GameSprite):
             )
             vfx_callback(mid)
 
-    # ── 每幀更新 ──────────────────────────────────────────────────────────────
-    def update(
+    def take_damage(
         self,
-        enemies: Optional[list["Unit"]] = None,
+        amount: int,
         vfx_callback: Optional[VFXCallback] = None,
-        enemy_buildings: Optional[list["Building"]] = None,
     ) -> None:
-        """
-        FSM 更新主入口。優先順序：
-          1. 戰鬥（有敵方 Unit 在 scan_range 內）
-          2. 行軍（沿 waypoints 前進）
-          3. 攻城（waypoints 耗盡後，攻打最近敵方建築）
-
-        Parameters
-        ----------
-        enemies         : 存活 Unit 列表，啟用掃描攻擊
-        vfx_callback    : 爆炸特效回調
-        enemy_buildings : 敵方建築列表，waypoints 完成後啟用攻城
-        """
         if self.is_dead:
             return
+        self.hp = max(0, self.hp - amount)
+        if self.hp == 0:
+            self.die(vfx_callback)
 
-        # 攻擊冷卻累加（每幀 +1）
+    def die(self, vfx_callback: Optional[VFXCallback] = None) -> None:
+        if self.is_dead:
+            return
+        self.is_dead = True
+        self.state   = "dead"
+        self.target  = None
+        self.waypoints.clear()
+        if vfx_callback:
+            vfx_callback(tuple(self.pos))
+        print(f"[Unit] {self.kind} (team={self.team}) died at {self.pos}")
+
+    # ── Per-frame update (FSM) ────────────────────────────────────────────────
+    def update(
+        self,
+        enemies:         Optional[list["Unit"]]     = None,
+        vfx_callback:    Optional[VFXCallback]      = None,
+        enemy_buildings: Optional[list["Building"]] = None,
+    ) -> None:
+        if self.is_dead:
+            return
         if self.atk_timer < self.atk_cd:
             self.atk_timer += 1
 
-        # ── 優先級 1: 對抗敵方 Unit ───────────────────────────────────────────
+        # Priority 1: combat — enemy unit in scan range
         if enemies is not None:
             target_enemy = self.scan_for_enemies(enemies)
-
             if target_enemy:
                 if self.state == "march":
                     self.state = "combat"
-                    self._locked_enemy = target_enemy
-                    self._target_building = None   # 放棄攻城
+                    self._locked_enemy    = target_enemy
+                    self._target_building = None
                 self.rotate_to(tuple(target_enemy.pos))
                 self.attack(target_enemy, vfx_callback)
-                return   # combat 中不移動
-
+                return
             else:
                 if self.state == "combat":
                     self.state = "march"
@@ -488,26 +478,24 @@ class Unit(GameSprite):
                     if self.waypoints:
                         self.move_to(self.waypoints[0])
 
-        # ── 優先級 2: 仍有 waypoints → 繼續行軍 ──────────────────────────────
+        # Priority 2: march along waypoints
         if self.target or self.waypoints:
             self._march_step()
             return
 
-        # ── 優先級 3: waypoints 耗盡 → 攻城模式 ──────────────────────────────
+        # Priority 3: assault enemy HQ (waypoints exhausted)
         if enemy_buildings is not None:
-            # 更新或重新鎖定目標建築（前目標被摧毀時重掃）
-            if (self._target_building is None
-                    or self._target_building.is_dead):
+            if self._target_building is None or self._target_building.is_dead:
                 self._target_building = self.scan_for_buildings(enemy_buildings)
 
             if self._target_building and not self._target_building.is_dead:
                 self.state = "assault"
                 self.rotate_to(tuple(self._target_building.pos))
-                # 靠近建築（攻擊範圍 = 碰撞半徑 + 建築半徑 + 10px 緩衝）
-                atk_range = (self.collision_radius
-                             + self._target_building.collision_radius + 10)
+                atk_range = (
+                    self.collision_radius
+                    + self._target_building.collision_radius + 10
+                )
                 if self.dist_to(self._target_building) > atk_range:
-                    # 向建築前進一步
                     dx = self._target_building.pos[0] - self.pos[0]
                     dy = self._target_building.pos[1] - self.pos[1]
                     dist = math.hypot(dx, dy)
@@ -521,16 +509,13 @@ class Unit(GameSprite):
                 self.state = "march"
 
     def _march_step(self) -> None:
-        """沿 target / waypoints 前進一幀。"""
         if not self.target:
             if self.waypoints:
                 self.move_to(self.waypoints.pop(0))
             return
-
-        dx = self.target[0] - self.pos[0]
-        dy = self.target[1] - self.pos[1]
+        dx   = self.target[0] - self.pos[0]
+        dy   = self.target[1] - self.pos[1]
         dist = math.hypot(dx, dy)
-
         if dist <= self.speed:
             self.pos[0] = self.target[0]
             self.pos[1] = self.target[1]
@@ -541,7 +526,7 @@ class Unit(GameSprite):
             self.pos[0] += (dx / dist) * self.speed
             self.pos[1] += (dy / dist) * self.speed
 
-    # ── 渲染 ──────────────────────────────────────────────────────────────────
+    # ── Rendering ─────────────────────────────────────────────────────────────
     def draw(self, screen: pygame.Surface, camera_offset: tuple[int, int] = (0, 0)) -> None:
         if self.is_dead:
             return
@@ -552,40 +537,39 @@ class Unit(GameSprite):
         if self.is_dead:
             return
         super().draw_debug(screen, camera_offset)
-        # 掃描範圍圓（半透明感用低飽和色）
         cx = int(self.pos[0]) - camera_offset[0]
         cy = int(self.pos[1]) - camera_offset[1]
         color = {
-            "march":   (80, 160, 255),
-            "combat":  (255, 80,  80),
-            "assault": (255, 160, 0),
-            "dead":    (80,  80,  80),
+            "march":   (80,  160, 255),
+            "combat":  (255,  80,  80),
+            "assault": (255, 160,   0),
+            "dead":    ( 80,  80,  80),
         }.get(self.state, (200, 200, 200))
         pygame.draw.circle(screen, color, (cx, cy), int(self.scan_range), 1)
 
-    def _draw_hp_bar(self, screen: pygame.Surface, camera_offset: tuple[int, int]) -> None:
-        cx = int(self.pos[0]) - camera_offset[0]
-        cy = int(self.pos[1]) - camera_offset[1]
+    def _draw_hp_bar(self, screen: pygame.Surface, cam: tuple[int, int]) -> None:
+        cx = int(self.pos[0]) - cam[0]
+        cy = int(self.pos[1]) - cam[1]
         bar_w, bar_h = 32, 4
         x = cx - bar_w // 2
         y = cy - self.surface.get_height() // 2 - 8
         ratio = max(0.0, self.hp / self.max_hp)
-        pygame.draw.rect(screen, (100, 0, 0),  (x, y, bar_w, bar_h))
-        pygame.draw.rect(screen, (0, 220, 80), (x, y, int(bar_w * ratio), bar_h))
+        pygame.draw.rect(screen, (100,  0,  0), (x, y, bar_w, bar_h))
+        pygame.draw.rect(screen, (0,  220, 80), (x, y, int(bar_w * ratio), bar_h))
 
 
-# ── VFX 動畫 Sprite ───────────────────────────────────────────────────────────
+# ── VFX Sprite ────────────────────────────────────────────────────────────────
 class VFXSprite:
     """
-    從 Sprite Sheet 播放一次性動畫（爆炸特效）。
-    is_done == True 時由 BattleManager 移除。
+    One-shot sprite-sheet animation (explosion effects).
+    Marked is_done=True when animation completes; caller removes from list.
     """
 
     def __init__(
         self,
-        sheet_key: str,
-        manager: AssetManager,
-        pos: tuple[float, float],
+        sheet_key:   str,
+        manager:     AssetManager,
+        pos:         tuple[float, float],
         frame_delay: int = 3,
     ) -> None:
         self.pos         = list(pos)

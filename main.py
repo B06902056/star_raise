@@ -1,34 +1,32 @@
 """
-main.py — Star Raise Game  (v4: AI + API + Base Assault)
+main.py — Star Raise  (v5: Phase 1 + Phase 2)
 
-執行緒架構
-----------
-  主執行緒  : pygame GameLoop（必須在主執行緒）
-  背景執行緒: uvicorn FastAPI（daemon，隨主執行緒結束）
+Phase 1 features (camera & world)
+----------------------------------
+  - 19.5:9 landscape screen  1280 × 590
+  - 7× wide battlefield      8960 × 590
+  - Camera: left-mouse drag scrolls horizontally; clamped to world bounds
+  - Player 1× base (x 0–1280) contains two 4×4 building grids (Top / Bot lane)
+  - Player HQ at world (80, 295)  |  Enemy HQ at world (8880, 295)
+  - All world objects use camera_offset; HUD is always screen-fixed
 
-場景配置
---------
-  [玩家 Team 0 — 左側]
-    Barracks  (80, H/2)       → B 鍵 Marine(50💎) / T 鍵 Tank(150💎)
-    Refinery  (80, H/2-120)   → +15/週期被動收入
+Phase 2 features (auto-spawn & economy)
+-----------------------------------------
+  - Manual B/T queuing REMOVED; no ProductionQueue; no AIController
+  - Slot buildings auto-spawn their unit_type when spawn_timer fires
+  - Top-grid buildings  → units march along TOP_LANE_Y  (y ≈ 147)
+  - Bottom-grid buildings → units march along BOT_LANE_Y (y ≈ 442)
+  - Enemy HQ auto-spawns on both lanes at a fixed cadence
+  - ResourceManager income = BASE (10) + Σ building.income_bonus per 5 s cycle
+  - HUD shows income breakdown: base + bonus per building type
 
-  [敵方 Team 1 — 右側]
-    Barracks  (W-80, H/2)     → AIController 每 10s 決策生產
-    Refinery  (W-80, H/2-120) → AI 收入來源
+Lane paths (straight horizontal, two Y-coordinates)
+------------------------------------------------------
+  TOP_LANE_Y = SCREEN_H // 4   ≈ 147
+  BOT_LANE_Y = 3*SCREEN_H // 4 ≈ 442
 
-勝敗條件
---------
-  VICTORY : 敵方 Barracks 或 Refinery HP 歸零
-  DEFEAT  : 玩家 Barracks 或 Refinery HP 歸零
-
-熱鍵
-----
-  B     生產 Marine   (50 礦)
-  T     生產 Tank    (150 礦)
-  D     切換 Debug 模式
-  R     重置場景
-  ESC   離開
-  左鍵  手動爆炸 VFX
+  Player units:  spawn_pos  →  (SCREEN_W+50, lane_y)  →  (WORLD_W-200, lane_y)
+  Enemy  units:  spawn_pos  →  (WORLD_W-SCREEN_W-50, lane_y)  →  (200, lane_y)
 """
 
 from __future__ import annotations
@@ -44,259 +42,385 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.asset_manager import AssetManager
 from src.sprite        import Building, Unit, VFXSprite
 from src.battle        import BattleManager
-from src.logic         import (
-    ResourceManager, ProductionQueue, AIController,
-    UNIT_COSTS,
-)
+from src.logic         import ResourceManager, BUILDING_SPECS, BASE_INCOME
 import src.shared as shared
 
-# ── 視窗與常數 ────────────────────────────────────────────────────────────────
-SCREEN_W = 1024
-SCREEN_H = 768
+# ── Screen / world constants ──────────────────────────────────────────────────
+SCREEN_W = 1280
+SCREEN_H = int(SCREEN_W * 9 / 19.5)   # 590  (19.5:9 landscape)
+WORLD_W  = SCREEN_W * 7               # 8960
+WORLD_H  = SCREEN_H
 FPS      = 60
-TITLE    = "⭐ Star Raise — v4 AI + API"
+TITLE    = "Star Raise — v5 (Phase 2: Auto-Spawn)"
 
-COLOR_BG      = (18,  22,  36)
-COLOR_GRID    = (28,  34,  50)
-COLOR_TEXT    = (200, 220, 255)
-COLOR_HOTKEY  = (255, 200, 60)
-COLOR_WARN    = (255, 80,  80)
-COLOR_OK      = (80,  220, 120)
-COLOR_MINERAL = (100, 200, 255)
-COLOR_GOLD    = (255, 200, 30)
-COLOR_QUEUE   = (80,  140, 255)
-COLOR_VICTORY = (60,  220, 100)
-COLOR_DEFEAT  = (220, 60,  60)
+# ── Lane Y-coordinates (horizontal march paths) ───────────────────────────────
+# Top lane: upper quarter  /  Bot lane: lower quarter
+TOP_LANE_Y: int = SCREEN_H // 4          # ≈ 147
+BOT_LANE_Y: int = 3 * SCREEN_H // 4      # ≈ 442
 
+# ── Building-slot layout (player 1× base zone) ───────────────────────────────
+SLOT_SIZE  = 64
+SLOT_GAP   = 8
+SLOT_STEP  = SLOT_SIZE + SLOT_GAP   # 72
+GRID_COLS  = 4
+GRID_ROWS  = 4
+GRID_H     = GRID_ROWS * SLOT_STEP - SLOT_GAP   # 280
+
+GRID_ORIGIN_X    = 148               # clears Player HQ sprite (cx=80, w=96)
+_LANE_H          = SCREEN_H // 2     # 295
+_TOP_LANE_MID    = _LANE_H // 2      # 147  (= TOP_LANE_Y ✓)
+_BOT_LANE_MID    = _LANE_H + _LANE_H // 2  # 442  (= BOT_LANE_Y ✓)
+GRID_ORIGIN_Y_TOP = _TOP_LANE_MID - GRID_H // 2   #  7
+GRID_ORIGIN_Y_BOT = _BOT_LANE_MID - GRID_H // 2   # 302
+
+
+def _make_slot_positions(origin_y: int) -> list[tuple[int, int]]:
+    """Return 16 world (x, y) top-left corners for a 4×4 grid."""
+    return [
+        (GRID_ORIGIN_X + col * SLOT_STEP,
+         origin_y       + row * SLOT_STEP)
+        for row in range(GRID_ROWS)
+        for col in range(GRID_COLS)
+    ]
+
+
+TOP_LANE_SLOTS: list[tuple[int, int]] = _make_slot_positions(GRID_ORIGIN_Y_TOP)
+BOT_LANE_SLOTS: list[tuple[int, int]] = _make_slot_positions(GRID_ORIGIN_Y_BOT)
+ALL_SLOTS:      list[tuple[int, int]] = TOP_LANE_SLOTS + BOT_LANE_SLOTS   # 32
+
+# ── API ───────────────────────────────────────────────────────────────────────
 API_PORT = int(os.environ.get("PORT", 8000))
 
+# ── Colours ───────────────────────────────────────────────────────────────────
+COLOR_BG        = (18,  22,  36)
+COLOR_GRID      = (28,  34,  50)
+COLOR_TEXT      = (200, 220, 255)
+COLOR_GOLD      = (255, 200,  30)
+COLOR_WARN      = (255,  80,  80)
+COLOR_OK        = ( 80, 220, 120)
+COLOR_LANE_DIV  = ( 40,  60, 100)
+COLOR_ZONE_DIV  = ( 80,  50, 140)
+COLOR_SLOT_FILL = ( 40,  80, 140,  60)
+COLOR_SLOT_EDGE = (100, 160, 220)
+COLOR_VICTORY   = ( 60, 220, 100)
+COLOR_DEFEAT    = (220,  60,  60)
+COLOR_TOP_LANE  = ( 80, 160, 255)
+COLOR_BOT_LANE  = (255, 160,  60)
 
-# ── 背景 API 執行緒 ───────────────────────────────────────────────────────────
-def _start_api_server() -> None:
-    """在 daemon 執行緒中啟動 uvicorn，不阻塞 pygame 主執行緒。"""
+
+# ── FastAPI background thread ─────────────────────────────────────────────────
+def _start_api() -> None:
     try:
         import uvicorn
-        uvicorn.run(
-            "server:app",
-            host="0.0.0.0",
-            port=API_PORT,
-            log_level="warning",
-            access_log=False,
-        )
+        uvicorn.run("server:app", host="0.0.0.0", port=API_PORT,
+                    log_level="warning", access_log=False)
     except Exception as e:
-        print(f"[API] ⚠️  API 伺服器啟動失敗: {e}")
+        print(f"[API] server failed to start: {e}")
 
 
-def launch_api_thread() -> threading.Thread:
-    t = threading.Thread(target=_start_api_server, daemon=True, name="api-server")
+def launch_api_thread() -> None:
+    t = threading.Thread(target=_start_api, daemon=True, name="api-server")
     t.start()
-    print(f"[API] 🚀 FastAPI 啟動於 http://localhost:{API_PORT}")
-    print(f"[API]    端點: /api/game_state  /api/units  /api/buildings")
-    return t
+    print(f"[API] FastAPI at http://localhost:{API_PORT}")
 
 
-# ── 單位工廠 ──────────────────────────────────────────────────────────────────
-def make_unit(
-    unit_type: str,
-    manager: AssetManager,
-    spawn_pos: tuple[float, float],
-    team: int,
+# ── Camera ────────────────────────────────────────────────────────────────────
+class Camera:
+    """
+    Horizontal-scroll camera over the 7× battlefield.
+
+    cam_x = world-X of the viewport's left edge.
+    offset = (cam_x, 0) → subtract from world pos before drawing.
+
+    Scroll mechanic
+    ---------------
+    Left-mouse drag: cam_x moves opposite to mouse delta.
+    Boundaries:  0  ≤  cam_x  ≤  WORLD_W − SCREEN_W  (= 7680)
+    """
+
+    DRAG_THRESHOLD = 4
+
+    def __init__(self) -> None:
+        self.cam_x: float = 0.0
+        self._drag_active:   bool  = False
+        self._drag_start_mx: int   = 0
+        self._drag_start_cx: float = 0.0
+
+    def on_mouse_down(self, mx: int) -> None:
+        self._drag_active   = True
+        self._drag_start_mx = mx
+        self._drag_start_cx = self.cam_x
+
+    def on_mouse_move(self, mx: int) -> None:
+        if not self._drag_active:
+            return
+        self.cam_x = self._drag_start_cx - (mx - self._drag_start_mx)
+        self._clamp()
+
+    def on_mouse_up(self) -> None:
+        self._drag_active = False
+
+    def was_dragged(self, mx: int) -> bool:
+        return abs(mx - self._drag_start_mx) > self.DRAG_THRESHOLD
+
+    def _clamp(self) -> None:
+        self.cam_x = max(0.0, min(self.cam_x, float(WORLD_W - SCREEN_W)))
+
+    @property
+    def offset(self) -> tuple[int, int]:
+        return (int(self.cam_x), 0)
+
+    def screen_to_world(self, sx: int, sy: int) -> tuple[float, float]:
+        return (sx + self.cam_x, float(sy))
+
+
+# ── Unit factory ──────────────────────────────────────────────────────────────
+def make_unit_for_lane(
+    unit_type:  str,
+    spawn_pos:  tuple[float, float],
+    lane:       str,
+    team:       int,
+    manager:    AssetManager,
 ) -> Unit:
-    """team=0 → 向右行軍，team=1 → 向左行軍。"""
-    dest = (SCREEN_W - 160, spawn_pos[1]) if team == 0 else (160, spawn_pos[1])
-    u = Unit(unit_type, manager, pos=spawn_pos, team=team)
-    u.set_waypoints([dest])
-    return u
+    """
+    Create a Unit and assign lane-appropriate waypoints.
+
+    Lane path layout (straight horizontal lines)
+    ---------------------------------------------
+    lane_y = TOP_LANE_Y (147) or BOT_LANE_Y (442)
+
+    Player (team 0):
+      spawn_pos  →  align-point (SCREEN_W+50, lane_y)  →  (WORLD_W-200, lane_y)
+
+    Enemy  (team 1):
+      spawn_pos  →  align-point (WORLD_W-SCREEN_W-50, lane_y)  →  (200, lane_y)
+
+    The intermediate "align-point" ensures the unit reaches its lane Y
+    before marching horizontally, regardless of where the building sits
+    within the player's 1× base zone.
+    """
+    lane_y  = TOP_LANE_Y if lane == "top" else BOT_LANE_Y
+    unit    = Unit(unit_type, manager, pos=spawn_pos, team=team)
+
+    if team == 0:
+        unit.set_waypoints([
+            (SCREEN_W + 50,  lane_y),   # exit player zone aligned with lane
+            (WORLD_W - 200,  lane_y),   # near enemy HQ
+        ])
+    else:
+        unit.set_waypoints([
+            (WORLD_W - SCREEN_W - 50, lane_y),   # exit enemy zone
+            (200,                     lane_y),   # near player HQ
+        ])
+    return unit
 
 
-# ── 背景 ──────────────────────────────────────────────────────────────────────
-def draw_background(screen: pygame.Surface) -> None:
+# ── Draw helpers ──────────────────────────────────────────────────────────────
+
+def draw_background(screen: pygame.Surface, cam_x: float) -> None:
+    """Scrolling world grid + zone boundaries + lane guides."""
     screen.fill(COLOR_BG)
-    for x in range(0, SCREEN_W, 64):
-        pygame.draw.line(screen, COLOR_GRID, (x, 0), (x, SCREEN_H))
+
+    # Vertical grid lines (only those on-screen)
+    first_wx = (int(cam_x) // 64) * 64
+    for wx in range(first_wx, int(cam_x) + SCREEN_W + 64, 64):
+        sx = wx - int(cam_x)
+        pygame.draw.line(screen, COLOR_GRID, (sx, 0), (sx, SCREEN_H))
+
+    # Horizontal grid lines
     for y in range(0, SCREEN_H, 64):
         pygame.draw.line(screen, COLOR_GRID, (0, y), (SCREEN_W, y))
-    pygame.draw.line(screen, (40, 60, 110),
-                     (SCREEN_W // 2, 0), (SCREEN_W // 2, SCREEN_H), 1)
+
+    # Zone boundary lines (player | neutral | enemy)
+    for bwx in (SCREEN_W, WORLD_W - SCREEN_W):
+        bsx = bwx - int(cam_x)
+        if -2 <= bsx <= SCREEN_W + 2:
+            pygame.draw.line(screen, COLOR_ZONE_DIV, (bsx, 0), (bsx, SCREEN_H), 2)
+
+    # Horizontal lane divider (screen midline)
+    pygame.draw.line(screen, COLOR_LANE_DIV,
+                     (0, SCREEN_H // 2), (SCREEN_W, SCREEN_H // 2), 1)
+
+    # Lane Y guides (dashed horizontal lines showing march paths)
+    for lane_y, col in ((TOP_LANE_Y, COLOR_TOP_LANE), (BOT_LANE_Y, COLOR_BOT_LANE)):
+        pos = 0
+        while pos < SCREEN_W:
+            pygame.draw.line(screen, col, (pos, lane_y), (min(pos + 20, SCREEN_W), lane_y))
+            pos += 30
 
 
-# ── 勝敗覆蓋層 ────────────────────────────────────────────────────────────────
+def _dashed_hline(surf, color, x1, x2, y, dash=8, gap=4):
+    pos = x1
+    while pos < x2:
+        end = min(pos + dash, x2)
+        pygame.draw.line(surf, color, (pos, y), (end, y))
+        pos += dash + gap
+
+
+def _dashed_vline(surf, color, x, y1, y2, dash=8, gap=4):
+    pos = y1
+    while pos < y2:
+        end = min(pos + dash, y2)
+        pygame.draw.line(surf, color, (x, pos), (x, end))
+        pos += dash + gap
+
+
+def _dashed_rect(surf, color, x, y, w, h):
+    _dashed_hline(surf, color, x, x + w, y)
+    _dashed_hline(surf, color, x, x + w, y + h)
+    _dashed_vline(surf, color, x, y, y + h)
+    _dashed_vline(surf, color, x + w, y, y + h)
+
+
+def draw_building_slots(
+    screen:     pygame.Surface,
+    cam_x:      float,
+    slots:      list[tuple[int, int]],
+    occupied:   set[int],          # indices of occupied slots
+    slot_surf:  pygame.Surface,
+) -> None:
+    """Draw empty slot placeholders (occupied slots show building sprite instead)."""
+    for idx, (wx, wy) in enumerate(slots):
+        if idx in occupied:
+            continue                # building sprite drawn elsewhere
+        sx = wx - int(cam_x)
+        if sx + SLOT_SIZE < 0 or sx > SCREEN_W:
+            continue
+        screen.blit(slot_surf, (sx, wy))
+        lane_color = COLOR_TOP_LANE if idx < 16 else COLOR_BOT_LANE
+        _dashed_rect(screen, lane_color, sx, wy, SLOT_SIZE, SLOT_SIZE)
+
+
+# ── HUD ───────────────────────────────────────────────────────────────────────
+
+def draw_hud(
+    screen:          pygame.Surface,
+    font:            pygame.font.Font,
+    fps:             float,
+    res:             ResourceManager,
+    cam_x:           float,
+    income_flash:    bool,
+    slot_buildings:  list[Building],
+) -> None:
+    """
+    Fixed-to-screen HUD.  Two sections:
+
+    Top bar (resource strip):
+      Minerals  |  Income breakdown  |  Income cycle progress
+
+    Info strip below:
+      FPS  |  Camera position  |  hint line
+    """
+    # ── Top resource bar ──────────────────────────────────────────────────────
+    pygame.draw.rect(screen, (20, 28, 50), (0, 0, SCREEN_W, 28))
+    pygame.draw.rect(screen, (50, 70, 110), (0, 0, SCREEN_W, 28), 1)
+
+    mineral_col = COLOR_GOLD if income_flash else (200, 180, 80)
+
+    # Count alive buildings by type for income breakdown display
+    alive = [b for b in slot_buildings if not b.is_dead]
+    barracks_n = sum(1 for b in alive if b.kind == "barracks")
+    refinery_n = sum(1 for b in alive if b.kind == "refinery")
+
+    income_breakdown = f"Base {BASE_INCOME}"
+    if barracks_n:
+        income_breakdown += f" + {barracks_n}×Bar({barracks_n * BUILDING_SPECS['barracks']['income_bonus']})"
+    if refinery_n:
+        income_breakdown += f" + {refinery_n}×Ref({refinery_n * BUILDING_SPECS['refinery']['income_bonus']})"
+    income_breakdown += f" = {res.income_per_cycle}/5s"
+
+    minerals_txt = f"Minerals: {res.minerals}"
+    screen.blit(font.render(minerals_txt,     True, mineral_col),      (8, 7))
+    screen.blit(font.render(income_breakdown, True, (160, 200, 255)),  (200, 7))
+
+    # Income cycle progress bar (right side of top bar)
+    bar_x, bar_y, bar_w, bar_h = SCREEN_W - 180, 8, 170, 10
+    pygame.draw.rect(screen, (40, 40, 70),  (bar_x, bar_y, bar_w, bar_h))
+    pygame.draw.rect(screen, COLOR_GOLD,    (bar_x, bar_y, int(bar_w * res.cycle_progress), bar_h))
+    pygame.draw.rect(screen, (120, 100, 40),(bar_x, bar_y, bar_w, bar_h), 1)
+    screen.blit(font.render(f"{res.frames_to_next_cycle}f", True, (180, 160, 80)),
+                (bar_x - 36, bar_y - 1))
+
+    # ── Info / hint strip ────────────────────────────────────────────────────
+    hint_col = (255, 200, 60)
+    screen.blit(
+        font.render(
+            f"FPS: {fps:.0f}   CAM: {cam_x:.0f} / {WORLD_W - SCREEN_W}   "
+            f"Drag to scroll  |  RMB move unit  |  D debug  |  R reset  |  ESC quit",
+            True, hint_col,
+        ),
+        (8, 32),
+    )
+
+
 def draw_result_overlay(screen: pygame.Surface, result: str) -> None:
-    """VICTORY / DEFEAT 半透明全螢幕覆蓋，按 R 重置。"""
     overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
     if result == "VICTORY":
         overlay.fill((20, 80, 20, 180))
-        main_color   = COLOR_VICTORY
-        main_text    = "★  VICTORY  ★"
+        color = COLOR_VICTORY
+        text  = "VICTORY"
     else:
         overlay.fill((80, 20, 20, 180))
-        main_color   = COLOR_DEFEAT
-        main_text    = "✕  DEFEAT  ✕"
-
+        color = COLOR_DEFEAT
+        text  = "DEFEAT"
     screen.blit(overlay, (0, 0))
-
     font_big = pygame.font.Font(None, 96)
     font_sub = pygame.font.Font(None, 32)
-
-    main_surf = font_big.render(main_text, True, main_color)
-    sub_surf  = font_sub.render("按 R 重置  |  按 ESC 離開", True, COLOR_TEXT)
-
-    screen.blit(main_surf, main_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 30)))
-    screen.blit(sub_surf,  sub_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 60)))
+    s1 = font_big.render(text, True, color)
+    s2 = font_sub.render("R to reset  |  ESC to quit", True, (200, 220, 255))
+    screen.blit(s1, s1.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 30)))
+    screen.blit(s2, s2.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 60)))
 
 
-# ── 經濟面板（玩家）─────────────────────────────────────────────────────────
-def draw_economy_panel(
-    screen: pygame.Surface,
-    font: pygame.font.Font,
-    res: ResourceManager,
-    queue: ProductionQueue,
-    income_flash: bool,
-) -> None:
-    panel = pygame.Surface((262, 128), pygame.SRCALPHA)
-    panel.fill((0, 0, 0, 155))
-    screen.blit(panel, (8, 8))
-
-    y = 14
-    mineral_col = COLOR_GOLD if income_flash else COLOR_MINERAL
-    screen.blit(font.render(f"💎 礦石: {res.minerals}", True, mineral_col), (14, y))
-    y += 18
-
-    screen.blit(
-        font.render(
-            f"收入: +{res.income_per_cycle}/週期  ({res.frames_to_next_cycle}f)",
-            True, COLOR_TEXT,
-        ), (14, y),
-    )
-    y += 14
-    bar_w = 242
-    pygame.draw.rect(screen, (40, 40, 60),   (14, y, bar_w, 6))
-    pygame.draw.rect(screen, COLOR_GOLD,     (14, y, int(bar_w * res.cycle_progress), 6))
-    pygame.draw.rect(screen, (120, 100, 40), (14, y, bar_w, 6), 1)
-    y += 12
-
-    screen.blit(font.render("── 生產佇列 ──", True, COLOR_QUEUE), (14, y))
-    y += 16
-
-    if queue.is_busy:
-        screen.blit(
-            font.render(
-                f"▶ {(queue.current_unit or '?').upper()}  "
-                f"{queue.frames_remaining}f  [{queue.queue_len}排隊]",
-                True, COLOR_OK,
-            ), (14, y),
-        )
-        y += 14
-        pygame.draw.rect(screen, (30, 60, 30), (14, y, bar_w, 7))
-        pygame.draw.rect(screen, COLOR_OK,     (14, y, int(bar_w * queue.current_progress), 7))
-        pygame.draw.rect(screen, (60, 120, 60),(14, y, bar_w, 7), 1)
-        y += 10
-        for idx, kind in enumerate(queue.queue_summary()):
-            label = "M" if kind == "marine" else "T"
-            col   = (80, 160, 255) if kind == "marine" else (80, 220, 80)
-            pygame.draw.rect(screen, col, (14 + idx * 22, y, 18, 18))
-            screen.blit(font.render(label, True, (0, 0, 0)), (18 + idx * 22, y + 2))
-    else:
-        screen.blit(font.render("閒置 — 按 B 生產 Marine / T 生產 Tank",
-                                True, (140, 140, 180)), (14, y))
-
-
-# ── AI 狀態面板（右側）──────────────────────────────────────────────────────
-def draw_ai_panel(
-    screen: pygame.Surface,
-    font: pygame.font.Font,
-    ai: AIController,
-) -> None:
-    panel = pygame.Surface((220, 80), pygame.SRCALPHA)
-    panel.fill((0, 0, 0, 155))
-    x0 = SCREEN_W - 228
-    screen.blit(panel, (x0, 8))
-
-    y = 14
-    screen.blit(font.render("🤖 AI 狀態", True, COLOR_WARN), (x0 + 6, y))
-    y += 16
-    screen.blit(
-        font.render(
-            f"礦石: {ai.resource_mgr.minerals}  "
-            f"收入: {ai.resource_mgr.income_per_cycle}",
-            True, COLOR_TEXT,
-        ), (x0 + 6, y),
-    )
-    y += 14
-    next_dec = ai.decision_frames - ai._timer
-    screen.blit(
-        font.render(
-            f"決策倒數: {next_dec}f  "
-            f"佇列: {ai.queue.queue_len}  "
-            f"已派: {ai.total_spawned}",
-            True, COLOR_TEXT,
-        ), (x0 + 6, y),
-    )
-    y += 14
-    screen.blit(
-        font.render(f"上次: {ai.last_decision}", True, (180, 140, 200)),
-        (x0 + 6, y),
-    )
-
-
-# ── 底部熱鍵欄 ────────────────────────────────────────────────────────────────
-def draw_hotkey_bar(
-    screen: pygame.Surface,
-    font: pygame.font.Font,
-    res: ResourceManager,
-    debug: bool,
-) -> None:
-    marine_col = COLOR_OK if res.minerals >= UNIT_COSTS["marine"] else COLOR_WARN
-    tank_col   = COLOR_OK if res.minerals >= UNIT_COSTS["tank"]   else COLOR_WARN
-    parts = [
-        (f"[B] Marine {UNIT_COSTS['marine']}💎", marine_col),
-        ("  ", COLOR_TEXT),
-        (f"[T] Tank {UNIT_COSTS['tank']}💎", tank_col),
-        ("  |  [D] Debug", COLOR_WARN if debug else COLOR_HOTKEY),
-        ("  [R] Reset  [ESC] 離開", COLOR_HOTKEY),
-    ]
-    x, y = 10, SCREEN_H - 20
-    for text, color in parts:
-        surf = font.render(text, True, color)
-        screen.blit(surf, (x, y))
-        x += surf.get_width()
-
-
-# ── 單位卡片 ──────────────────────────────────────────────────────────────────
 def draw_unit_cards(
     screen: pygame.Surface,
-    font: pygame.font.Font,
-    units: list[Unit],
+    font:   pygame.font.Font,
+    units:  list[Unit],
 ) -> None:
-    team0 = [u for u in units if u.team == 0][:3]
-    team1 = [u for u in units if u.team == 1][:3]
-    for group, x_base in [(team0, 10), (team1, SCREEN_W - 220)]:
+    """Compact unit status cards pinned to left (player) and right (enemy) sides."""
+    for group, x_base in [
+        ([u for u in units if u.team == 0][:3], 8),
+        ([u for u in units if u.team == 1][:3], SCREEN_W - 218),
+    ]:
         for i, u in enumerate(group):
-            y_base = 148 + i * 58
-            card = pygame.Surface((210, 50), pygame.SRCALPHA)
-            card.fill((0, 0, 0, 130))
-            screen.blit(card, (x_base, y_base))
-            sym   = {"march": "🚶", "combat": "⚔", "assault": "🏰", "dead": "💀"}.get(u.state, u.state)
+            y0   = 52 + i * 50
+            card = pygame.Surface((210, 44), pygame.SRCALPHA)
+            card.fill((0, 0, 0, 120))
+            screen.blit(card, (x_base, y0))
+
+            label = "[Player]" if u.team == 0 else "[Enemy]"
             col   = COLOR_OK if u.team == 0 else COLOR_WARN
-            label = ["[玩家]", "[敵方]"][u.team]
+            sym   = {"march": ">>", "combat": "x", "assault": "HQ", "dead": "--"}.get(u.state, "?")
             screen.blit(
-                font.render(f"{label} {u.kind.upper()} {sym}", True, col),
-                (x_base + 6, y_base + 4),
+                font.render(f"{label} {u.kind.upper()} [{sym}]", True, col),
+                (x_base + 4, y0 + 4),
             )
-            bar_w, bar_h = 196, 9
+            # HP bar
+            bar_w = 198
             ratio = max(0.0, u.hp / u.max_hp)
             bar_c = (0, 200, 80) if ratio > 0.5 else (220, 180, 0) if ratio > 0.25 else (220, 50, 50)
-            pygame.draw.rect(screen, (80, 0, 0),    (x_base + 6, y_base + 26, bar_w, bar_h))
-            pygame.draw.rect(screen, bar_c,          (x_base + 6, y_base + 26, int(bar_w * ratio), bar_h))
-            pygame.draw.rect(screen, (160, 160, 160),(x_base + 6, y_base + 26, bar_w, bar_h), 1)
+            pygame.draw.rect(screen, (80,  0, 0), (x_base + 4, y0 + 24, bar_w, 8))
+            pygame.draw.rect(screen, bar_c,       (x_base + 4, y0 + 24, int(bar_w * ratio), 8))
             screen.blit(
-                font.render(f"HP {u.hp}/{u.max_hp}", True, COLOR_TEXT),
-                (x_base + 6, y_base + 37),
+                font.render(f"HP {u.hp}/{u.max_hp}", True, (180, 180, 220)),
+                (x_base + 4, y0 + 33),
             )
 
 
 # ── GameLoop ──────────────────────────────────────────────────────────────────
 class GameLoop:
+
+    # Pre-defined slot placements for demo (index into ALL_SLOTS, lane, kind)
+    # Slot 0–15 = Top Lane,  Slot 16–31 = Bottom Lane
+    _DEMO_BUILDINGS: list[tuple[int, str]] = [
+        # (slot_index, kind)
+        (0,  "barracks"),   # top-lane, col 0 row 0
+        (1,  "barracks"),   # top-lane, col 1 row 0
+        (4,  "refinery"),   # top-lane, col 0 row 1
+        (16, "barracks"),   # bot-lane, col 0 row 0
+        (17, "barracks"),   # bot-lane, col 1 row 0
+        (20, "refinery"),   # bot-lane, col 0 row 1
+    ]
 
     def __init__(self) -> None:
         pygame.init()
@@ -305,23 +429,32 @@ class GameLoop:
         self.font    = pygame.font.Font(None, 18)
         self.fps_clk = pygame.time.Clock()
         self.frame   = 0
+        self.camera  = Camera()
 
-        # ── 素材 ──────────────────────────────────────────────────────────────
+        # Pre-create reusable slot placeholder surface
+        self._slot_surf = pygame.Surface((SLOT_SIZE, SLOT_SIZE), pygame.SRCALPHA)
+        self._slot_surf.fill(COLOR_SLOT_FILL)
+
+        # Assets
         self.manager = AssetManager()
-        print("\n📦 預載素材...")
+        print("\n[Star Raise] Loading assets...")
         self.manager.preload_all()
-        print("✅ 預載完成\n")
+        print("[Star Raise] Assets ready.\n")
 
-        # ── API 背景執行緒 ────────────────────────────────────────────────────
+        # API
         launch_api_thread()
 
-        # ── 場景初始化 ────────────────────────────────────────────────────────
+        # Scene
         self._init_scene()
 
-    # ── 場景初始化（可重置）──────────────────────────────────────────────────
+    # ── Scene init (also used for R-reset) ───────────────────────────────────
     def _init_scene(self) -> None:
-        # VFX
-        self.vfx_list: list[VFXSprite] = []
+        self.vfx_list:  list[VFXSprite] = []
+        self.units:     list[Unit]      = []
+        self.frame                      = 0
+        self.game_result: str | None    = None
+        self.debug_mode:  bool          = False
+        self.income_flash:int           = 0
 
         def spawn_vfx(pos: tuple[float, float]) -> None:
             self.vfx_list.append(
@@ -329,82 +462,90 @@ class GameLoop:
             )
         self.spawn_vfx = spawn_vfx
 
-        # ── 玩家建築 ──────────────────────────────────────────────────────────
-        self.player_barracks = Building(
-            "barracks", self.manager, pos=(80, SCREEN_H // 2), team=0, hp=600,
-        )
-        self.player_refinery = Building(
-            "refinery", self.manager, pos=(80, SCREEN_H // 2 - 120), team=0, hp=400,
-        )
-        # 玩家資源
-        self.res = ResourceManager(starting=100)
-        self.res.register_refinery()
-        # 玩家生產佇列注入 Barracks
-        self.player_barracks.queue = ProductionQueue(
-            spawn_pos=self.player_barracks.spawn_point
+        # ── Player HQ (is_hq=True, victory condition) ─────────────────────────
+        self.player_hq = Building(
+            "barracks", self.manager,
+            pos=(80, WORLD_H // 2),
+            hp=800, team=0,
+            lane="none", is_hq=True,
         )
 
-        # ── 敵方建築 ──────────────────────────────────────────────────────────
-        self.enemy_barracks = Building(
-            "barracks", self.manager, pos=(SCREEN_W - 80, SCREEN_H // 2), team=1, hp=600,
+        # ── Enemy HQ (is_hq=True) ─────────────────────────────────────────────
+        self.enemy_hq = Building(
+            "refinery", self.manager,
+            pos=(WORLD_W - 80, WORLD_H // 2),
+            hp=800, team=1,
+            lane="none", is_hq=True,
         )
-        self.enemy_refinery = Building(
-            "refinery", self.manager, pos=(SCREEN_W - 80, SCREEN_H // 2 - 120), team=1, hp=400,
-        )
-        # 敵方 AI 資源 + 佇列
-        ai_res   = ResourceManager(starting=100)
-        ai_res.register_refinery()
-        ai_queue = ProductionQueue(spawn_pos=self.enemy_barracks.spawn_point)
-        self.enemy_barracks.queue = ai_queue
-        self.ai = AIController(ai_res, ai_queue, decision_frames=600)
 
-        # ── 單位列表 ──────────────────────────────────────────────────────────
-        self.units: list[Unit] = []
+        # ── Slot buildings (auto-spawn, income) ───────────────────────────────
+        self.slot_buildings: list[Building] = []
+        self._occupied_slots: set[int]      = set()
 
-        # ── 勝敗狀態 ──────────────────────────────────────────────────────────
-        self.game_result: str | None = None
+        # Economy — income driven by slot buildings
+        self.res = ResourceManager(starting=150)
 
-        # ── UI 狀態 ───────────────────────────────────────────────────────────
-        self.debug_mode   = False
-        self.income_flash = 0
+        # Place demo buildings from _DEMO_BUILDINGS table
+        for slot_idx, kind in self._DEMO_BUILDINGS:
+            self._place_building(slot_idx, kind, team=0)
 
-        print("[GameLoop] 🔄 場景初始化完成")
+        # ── Enemy auto-spawn state ─────────────────────────────────────────────
+        # Enemy HQ spawns one unit per lane independently
+        self._enemy_top_timer: int = 240   # stagger: top fires at t=240 first
+        self._enemy_bot_timer: int = 0     # bot fires at t=480 first
+        self._enemy_spawn_rate: int = 480  # 8 s @ 60 fps per lane
 
-    # ── 便利屬性 ──────────────────────────────────────────────────────────────
-    @property
-    def player_queue(self) -> ProductionQueue:
-        return self.player_barracks.queue  # type: ignore[return-value]
+        print(f"[Scene] Reset.  Slot buildings: {len(self.slot_buildings)}  "
+              f"Income: {self.res.income_per_cycle}/cycle")
 
+    def _place_building(self, slot_idx: int, kind: str, team: int) -> Building:
+        """
+        Instantiate a building at the given ALL_SLOTS index and register it.
+        Building centre = slot top-left + (SLOT_SIZE/2, SLOT_SIZE/2).
+        """
+        sx, sy = ALL_SLOTS[slot_idx]
+        cx     = sx + SLOT_SIZE // 2
+        cy     = sy + SLOT_SIZE // 2
+        lane   = "top" if slot_idx < 16 else "bottom"
+        b      = Building(kind, self.manager, pos=(cx, cy), team=team, lane=lane)
+        self.slot_buildings.append(b)
+        self._occupied_slots.add(slot_idx)
+        self.res.register_building(b)
+        return b
+
+    # ── Properties ────────────────────────────────────────────────────────────
     @property
     def all_buildings(self) -> list[Building]:
-        return [
-            self.player_barracks, self.player_refinery,
-            self.enemy_barracks,  self.enemy_refinery,
-        ]
+        """All buildings: HQs + slot buildings (for BattleManager)."""
+        return [self.player_hq, self.enemy_hq] + self.slot_buildings
 
-    # ── 勝敗檢查 ──────────────────────────────────────────────────────────────
-    def _check_victory_condition(self) -> None:
+    # ── Victory check ─────────────────────────────────────────────────────────
+    def _check_victory(self) -> None:
         if self.game_result:
             return
-        player_dead = (self.player_barracks.is_dead or self.player_refinery.is_dead)
-        enemy_dead  = (self.enemy_barracks.is_dead  or self.enemy_refinery.is_dead)
-        if enemy_dead and not player_dead:
+        if self.enemy_hq.is_dead:
             self.game_result = "VICTORY"
             shared.write({"game_result": "VICTORY"})
-            print("[Game] 🏆 VICTORY")
-        elif player_dead:
+            print("[Game] VICTORY")
+        elif self.player_hq.is_dead:
             self.game_result = "DEFEAT"
             shared.write({"game_result": "DEFEAT"})
-            print("[Game] 💔 DEFEAT")
+            print("[Game] DEFEAT")
 
-    # ── 共享狀態快照（每幀寫入 src.shared）──────────────────────────────────
+    # ── Shared-state snapshot ─────────────────────────────────────────────────
     def _push_state(self) -> None:
         shared.write({
-            "frame":       self.frame,
-            "game_result": self.game_result,
-            "minerals":    self.res.minerals,
-            "income_rate": self.res.income_per_cycle,
-            "unit_count":  sum(1 for u in self.units if not u.is_dead),
+            "frame":        self.frame,
+            "game_result":  self.game_result,
+
+            # Economy
+            "minerals":     self.res.minerals,
+            "income_base":  BASE_INCOME,
+            "income_bonus": self.res.income_bonus,
+            "income_rate":  self.res.income_per_cycle,
+
+            # Units
+            "unit_count": sum(1 for u in self.units if not u.is_dead),
             "units": [
                 {
                     "kind":   u.kind,
@@ -416,30 +557,43 @@ class GameLoop:
                 }
                 for u in self.units if not u.is_dead
             ],
+
+            # Buildings
             "buildings": [
                 {
-                    "kind":    b.kind,
-                    "team":    b.team,
-                    "hp":      b.hp,
-                    "max_hp":  b.max_hp,
-                    "is_dead": b.is_dead,
+                    "kind":         b.kind,
+                    "team":         b.team,
+                    "hp":           b.hp,
+                    "max_hp":       b.max_hp,
+                    "is_dead":      b.is_dead,
+                    "is_hq":        b.is_hq,
+                    "lane":         b.lane,
+                    "income_bonus": b.income_bonus,
+                    "spawn_progress": round(b.spawn_progress, 3),
                 }
                 for b in self.all_buildings
             ],
+
+            # Slot info
+            "slot_buildings": len(self.slot_buildings),
         })
 
-    # ── 主迴圈 ────────────────────────────────────────────────────────────────
+    # ── Main loop ─────────────────────────────────────────────────────────────
     def run(self) -> None:
-        running = True
+        lmb_down     = False
+        lmb_down_pos = (0, 0)
+        running      = True
+
         while running:
             self.fps_clk.tick(FPS)
             self.frame += 1
             fps = self.fps_clk.get_fps()
 
-            # ── 事件 ──────────────────────────────────────────────────────────
+            # ── Events ────────────────────────────────────────────────────────
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
@@ -447,90 +601,129 @@ class GameLoop:
                         self._init_scene()
                     elif event.key == pygame.K_d:
                         self.debug_mode = not self.debug_mode
-                    elif event.key == pygame.K_b and not self.game_result:
-                        self.player_barracks.produce("marine", self.res)
-                    elif event.key == pygame.K_t and not self.game_result:
-                        self.player_barracks.produce("tank", self.res)
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1:
-                        self.spawn_vfx(pygame.mouse.get_pos())
 
-            # ── 遊戲邏輯（勝負已定時暫停）────────────────────────────────────
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    mx, my = event.pos
+                    if event.button == 1:
+                        lmb_down     = True
+                        lmb_down_pos = (mx, my)
+                        self.camera.on_mouse_down(mx)
+                    elif event.button == 3:
+                        # RMB: move a test unit (debug convenience)
+                        wx, wy = self.camera.screen_to_world(mx, my)
+                        if self.units:
+                            u = self.units[0]
+                            u.waypoints.clear()
+                            u.move_to((wx, wy))
+
+                elif event.type == pygame.MOUSEMOTION:
+                    if lmb_down:
+                        self.camera.on_mouse_move(event.pos[0])
+
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        mx, my = event.pos
+                        if not self.camera.was_dragged(mx):
+                            wx, wy = self.camera.screen_to_world(mx, my)
+                            self.spawn_vfx((wx, wy))
+                        self.camera.on_mouse_up()
+                        lmb_down = False
+
+            # ── Game logic ────────────────────────────────────────────────────
             if not self.game_result:
 
-                # 1) 玩家收入週期
+                # 1) Player income cycle
                 if self.res.update():
                     self.income_flash = 30
                 if self.income_flash > 0:
                     self.income_flash -= 1
 
-                # 2) 玩家生產佇列
-                finished_player = self.player_queue.update()
-                if finished_player:
-                    u = make_unit(finished_player, self.manager,
-                                  self.player_barracks.spawn_point, team=0)
-                    self.units.append(u)
-                    print(f"[Player] 🔵 {finished_player} 出兵")
+                # 2) Slot buildings auto-spawn
+                for b in self.slot_buildings:
+                    result = b.update()
+                    if result:
+                        unit_type, spawn_pos, lane = result
+                        u = make_unit_for_lane(
+                            unit_type, spawn_pos, lane, team=0, manager=self.manager
+                        )
+                        self.units.append(u)
 
-                # 3) 敵方 AI（收入 + 佇列 + 決策 一體呼叫）
-                finished_ai = self.ai.update()
-                if finished_ai:
-                    u = make_unit(finished_ai, self.manager,
-                                  self.enemy_barracks.spawn_point, team=1)
-                    self.units.append(u)
-                    print(f"[AI] 🔴 {finished_ai} 出兵")
+                # 3) Enemy HQ auto-spawn (both lanes, staggered)
+                self._enemy_top_timer += 1
+                self._enemy_bot_timer += 1
 
-                # 4) 戰鬥（Unit vs Unit + Unit vs Building）
+                if self._enemy_top_timer >= self._enemy_spawn_rate:
+                    self._enemy_top_timer = 0
+                    u = make_unit_for_lane(
+                        "marine",
+                        (WORLD_W - 200, float(TOP_LANE_Y)),
+                        "top", team=1, manager=self.manager,
+                    )
+                    self.units.append(u)
+                    print("[Enemy] spawned marine → top lane")
+
+                if self._enemy_bot_timer >= self._enemy_spawn_rate:
+                    self._enemy_bot_timer = 0
+                    u = make_unit_for_lane(
+                        "marine",
+                        (WORLD_W - 200, float(BOT_LANE_Y)),
+                        "bottom", team=1, manager=self.manager,
+                    )
+                    self.units.append(u)
+                    print("[Enemy] spawned marine → bottom lane")
+
+                # 4) Combat + collision + cleanup
                 BattleManager.process_combat(
                     self.units,
                     self.spawn_vfx,
                     buildings=self.all_buildings,
                 )
-
-                # 5) 碰撞分離
                 BattleManager.resolve_collisions(self.units)
-
-                # 6) 死亡清理
                 self.units = BattleManager.cleanup_dead(self.units)
 
-                # 7) VFX
+                # 5) VFX
                 self.vfx_list = BattleManager.update_vfx(self.vfx_list)
 
-                # 8) 勝敗判斷
-                self._check_victory_condition()
+                # 6) Victory check
+                self._check_victory()
 
-            # 9) API 快照（無論勝負都更新）
+            # 7) API snapshot (always)
             self._push_state()
 
-            # ── 渲染 ──────────────────────────────────────────────────────────
-            draw_background(self.screen)
+            # ── Render ────────────────────────────────────────────────────────
+            cam_x      = self.camera.cam_x
+            cam_offset = self.camera.offset
 
-            for bld in self.all_buildings:
-                bld.draw(self.screen)
+            # World layer (scrolls with camera)
+            draw_background(self.screen, cam_x)
+            draw_building_slots(
+                self.screen, cam_x, ALL_SLOTS,
+                self._occupied_slots, self._slot_surf,
+            )
+
+            self.player_hq.draw(self.screen, cam_offset)
+            self.enemy_hq.draw(self.screen, cam_offset)
+
+            for b in self.slot_buildings:
+                b.draw(self.screen, cam_offset)
 
             for u in self.units:
-                u.draw(self.screen)
+                u.draw(self.screen, cam_offset)
                 if self.debug_mode:
-                    u.draw_debug(self.screen)
+                    u.draw_debug(self.screen, cam_offset)
 
             for vfx in self.vfx_list:
-                vfx.draw(self.screen)
+                vfx.draw(self.screen, cam_offset)
 
-            draw_economy_panel(
-                self.screen, self.font,
-                self.res, self.player_queue,
+            # Screen-fixed HUD layer (no cam_offset)
+            draw_hud(
+                self.screen, self.font, fps,
+                self.res, cam_x,
                 income_flash=self.income_flash > 0,
+                slot_buildings=self.slot_buildings,
             )
-            draw_ai_panel(self.screen, self.font, self.ai)
             draw_unit_cards(self.screen, self.font, self.units)
-            draw_hotkey_bar(self.screen, self.font, self.res, self.debug_mode)
 
-            self.screen.blit(
-                self.font.render(f"FPS:{fps:.0f}  Frame:{self.frame}", True, COLOR_TEXT),
-                (SCREEN_W // 2 - 60, 10),
-            )
-
-            # 勝敗覆蓋層（最後繪製）
             if self.game_result:
                 draw_result_overlay(self.screen, self.game_result)
 
@@ -540,6 +733,6 @@ class GameLoop:
         sys.exit()
 
 
-# ── 入口 ──────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     GameLoop().run()
