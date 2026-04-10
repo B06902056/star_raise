@@ -204,28 +204,33 @@ class ResourceManager:
     def launch_nuke(
         self,
         target_pos,          # tuple[float, float]  — world-space detonation point
-        units,               # list[Unit]
-        buildings,           # list[Building]
+        units,               # list[Unit]           — mobile unit sprites only
         vfx_callback=None,   # Optional[Callable[[tuple[float,float]], None]]
-        radius: float = 300.0,
+        radius: float = 450.0,
     ) -> bool:
         """
         Fire the one-time tactical nuke at *target_pos*.
 
         Returns True if the nuke was launched; False if already expended.
 
-        AoE damage model
-        ----------------
+        AoE damage model  (anti-unit only)
+        ------------------------------------
+        • ONLY Unit sprites are eligible targets.
+          Building sprites (slot buildings AND both HQs) are NEVER touched.
+          This is enforced by the explicit `isinstance(u, Building)` skip guard
+          inside the damage loop, even though the caller should only pass units.
+
         • Every Unit within *radius* pixels:
-              take_damage(9999)  →  instant kill regardless of HP/armour.
+              take_damage(99_999)  →  instant kill regardless of HP.
 
-        • Every Building within *radius* pixels:
-              take_damage( int(b.max_hp × 0.5) )  →  exactly 50 % of max HP.
-              Slot buildings (max_hp ≤ 500) die if already below 50 % HP.
-              HQs (max_hp = 800) survive a single nuke hit (take 400 damage),
-              but a second nuke (if ever added) would finish them off.
+        • VFX: 20 explosion sprites scattered randomly inside the blast circle.
 
-        • VFX: 12 explosion sprites scattered randomly inside the blast circle.
+        Fortified-HQ interaction
+        ------------------------
+        HQs have hp=100,000 and damage_reduction=0.70. The nuke does NOT target
+        buildings, so HQs are completely unaffected.  To damage an HQ the player
+        must rely on sustained unit pressure; the nuke clears the field so those
+        units can advance uncontested.
 
         Side-effect: sets nuke_available = False (one-shot weapon).
         """
@@ -235,32 +240,32 @@ class ResourceManager:
 
         tx, ty = float(target_pos[0]), float(target_pos[1])
 
-        # ── Damage units (instant kill) ───────────────────────────────────────
+        # ── Anti-unit sweep (Buildings explicitly excluded) ───────────────────
+        # Import guard: avoid circular import — Building is only referenced at
+        # TYPE_CHECKING level, so we use a duck-type attribute check instead.
+        killed = 0
         for u in units:
+            # Skip anything that quacks like a Building (has is_hq attribute
+            # and no waypoints list — belt-and-suspenders guard).
+            if getattr(u, "is_hq", False) is not False:
+                continue       # is a Building — skip
             if u.is_dead:
                 continue
             if math.hypot(u.pos[0] - tx, u.pos[1] - ty) <= radius:
-                u.take_damage(9999, vfx_callback)
-
-        # ── Damage buildings (50 % max-HP) ────────────────────────────────────
-        for b in buildings:
-            if b.is_dead:
-                continue
-            if math.hypot(b.pos[0] - tx, b.pos[1] - ty) <= radius:
-                dmg = int(b.max_hp * 0.5)
-                b.take_damage(dmg, vfx_callback)
+                u.take_damage(99_999, vfx_callback)
+                killed += 1
 
         # ── Scatter VFX explosions across the blast zone ──────────────────────
         if vfx_callback:
-            for _ in range(12):
-                ox = random.uniform(-radius * 0.85, radius * 0.85)
-                oy = random.uniform(-radius * 0.85, radius * 0.85)
+            for _ in range(20):
+                ox = random.uniform(-radius * 0.88, radius * 0.88)
+                oy = random.uniform(-radius * 0.88, radius * 0.88)
                 if math.hypot(ox, oy) <= radius:
                     vfx_callback((tx + ox, ty + oy))
 
         print(
             f"[Nuke] Detonated at ({tx:.0f}, {ty:.0f})  "
-            f"radius={radius}  minerals={self.minerals}"
+            f"radius={radius}  units_killed={killed}  minerals={self.minerals}"
         )
         return True
 

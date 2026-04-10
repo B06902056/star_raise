@@ -514,8 +514,8 @@ def draw_nuke_ghost(
 
     # Semi-transparent AoE fill
     aoe = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-    pygame.draw.circle(aoe, (220, 30, 30, 45), (gx, gy), 300)
-    pygame.draw.circle(aoe, (255, 80, 60, 180), (gx, gy), 300, 2)
+    pygame.draw.circle(aoe, (220, 30, 30, 45), (gx, gy), 450)
+    pygame.draw.circle(aoe, (255, 80, 60, 180), (gx, gy), 450, 2)
     screen.blit(aoe, (0, 0))
 
     # Crosshair lines
@@ -532,22 +532,42 @@ def draw_nuke_ghost(
 
 
 def draw_result_overlay(screen: pygame.Surface, result: GameState) -> None:
+    """
+    High-contrast full-screen end-game overlay.
+    Completely replaces HUD — minerals/cards are intentionally hidden.
+    Player restarts by pressing R (handled in run() event loop).
+    """
+    is_win = (result == GameState.VICTORY)
+
+    # ── Full-screen dim ───────────────────────────────────────────────────────
     overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-    if result == GameState.VICTORY:
-        overlay.fill((20, 80, 20, 180))
-        color = COLOR_VICTORY
-        text  = "VICTORY"
-    else:
-        overlay.fill((80, 20, 20, 180))
-        color = COLOR_DEFEAT
-        text  = "DEFEAT"
+    overlay.fill((10, 60, 10, 210) if is_win else (60, 10, 10, 210))
     screen.blit(overlay, (0, 0))
-    font_big = pygame.font.Font(None, 96)
-    font_sub = pygame.font.Font(None, 32)
-    s1 = font_big.render(text, True, color)
-    s2 = font_sub.render("R to reset  |  ESC to quit", True, (200, 220, 255))
-    screen.blit(s1, s1.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 30)))
-    screen.blit(s2, s2.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 60)))
+
+    # ── Bright banner strip ───────────────────────────────────────────────────
+    banner_h = 110
+    banner   = pygame.Surface((SCREEN_W, banner_h), pygame.SRCALPHA)
+    banner.fill((30, 160, 30, 230) if is_win else (160, 30, 30, 230))
+    screen.blit(banner, (0, SCREEN_H // 2 - banner_h // 2 - 10))
+
+    # ── Main text ─────────────────────────────────────────────────────────────
+    color    = COLOR_VICTORY if is_win else COLOR_DEFEAT
+    headline = "★  VICTORY  ★" if is_win else "✖  DEFEAT  ✖"
+    font_xl  = pygame.font.Font(None, 110)
+    font_md  = pygame.font.Font(None, 36)
+    font_sm  = pygame.font.Font(None, 24)
+
+    s_head = font_xl.render(headline, True, color)
+    screen.blit(s_head, s_head.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 2)))
+
+    sub = "Enemy HQ destroyed!" if is_win else "Your HQ has fallen!"
+    s_sub = font_md.render(sub, True, (230, 255, 230) if is_win else (255, 230, 230))
+    screen.blit(s_sub, s_sub.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 62)))
+
+    # ── Restart hint ──────────────────────────────────────────────────────────
+    hint = "[ Press  R  to Restart ]         [ ESC  to Quit ]"
+    s_hint = font_sm.render(hint, True, (180, 220, 180) if is_win else (220, 180, 180))
+    screen.blit(s_hint, s_hint.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 100)))
 
 
 def draw_unit_cards(
@@ -638,6 +658,9 @@ class GameLoop:
         # Nuke blast circle (world pos + fade timer)
         self.nuke_circle:       tuple[float,float] | None = None
         self.nuke_circle_timer: int                       = 0
+        # Screen shake — 30 frames = 0.5 s after nuke detonation
+        self.shake_timer:       int                       = 0
+        self.shake_amp:         int                       = 0
 
         # ── Phase 3: Build / demolish state ───────────────────────────────────
         self.build_state: BuildState     = BuildState.NONE
@@ -660,19 +683,20 @@ class GameLoop:
             )
         self.spawn_vfx = spawn_vfx
 
-        # ── Player HQ (is_hq=True, victory condition) ─────────────────────────
+        # ── Player HQ  (is_hq=True, victory condition) ────────────────────────
+        # HP = 100,000  │  Armour DR = 70 %  (set by Building.__init__)
         self.player_hq = Building(
             "barracks", self.manager,
             pos=(80, WORLD_H // 2),
-            hp=800, team=0,
+            hp=100_000, team=0,
             lane="none", is_hq=True,
         )
 
-        # ── Enemy HQ (is_hq=True) ─────────────────────────────────────────────
+        # ── Enemy HQ  (is_hq=True) ─────────────────────────────────────────────
         self.enemy_hq = Building(
             "refinery", self.manager,
             pos=(WORLD_W - 80, WORLD_H // 2),
-            hp=800, team=1,
+            hp=100_000, team=1,
             lane="none", is_hq=True,
         )
 
@@ -945,16 +969,20 @@ class GameLoop:
                         elif self.build_state == BuildState.NUKING:
                             # Detonate nuke at world cursor position
                             wx, wy = self.camera.screen_to_world(mx, my)
+                            # Buildings list is intentionally NOT passed —
+                            # this nuke is anti-unit only (see launch_nuke docstring)
                             fired = self.res.launch_nuke(
                                 (wx, wy),
                                 self.units,
-                                self.all_buildings,
                                 self.spawn_vfx,
                             )
                             if fired:
-                                # Red-alert flash for 90 frames (1.5 s)
+                                # Red-alert flash (90 frames = 1.5 s)
                                 self.nuke_flash        = 90
-                                # Persistent blast circle for 180 frames (3 s)
+                                # Screen shake (30 frames = 0.5 s, ±10 px)
+                                self.shake_timer       = 30
+                                self.shake_amp         = 10
+                                # Persistent blast circle (180 frames = 3 s)
                                 self.nuke_circle       = (wx, wy)
                                 self.nuke_circle_timer = 180
                             self.build_state = BuildState.NONE
@@ -1060,6 +1088,15 @@ class GameLoop:
             cam_x      = self.camera.cam_x
             cam_offset = self.camera.offset
 
+            # Screen shake: sinusoidal offset decaying over shake_timer frames
+            if self.shake_timer > 0:
+                t          = self.shake_timer / 30        # 1.0 → 0.0
+                amp        = int(self.shake_amp * t)
+                shake_dx   = int(amp * math.sin(self.frame * 1.7))
+                shake_dy   = int(amp * math.cos(self.frame * 2.3))
+                cam_offset = (cam_offset[0] + shake_dx, cam_offset[1] + shake_dy)
+                self.shake_timer -= 1
+
             # World layer (scrolls with camera)
             draw_background(self.screen, cam_x)
             draw_building_slots(
@@ -1081,34 +1118,35 @@ class GameLoop:
             for vfx in self.vfx_list:
                 vfx.draw(self.screen, cam_offset)
 
-            # Screen-fixed HUD layer (no cam_offset)
-            draw_hud(
-                self.screen, self.font, fps,
-                self.res, cam_x,
-                income_flash=self.income_flash > 0,
-                slot_buildings=self.slot_buildings,
-            )
-            draw_unit_cards(self.screen, self.font, self.units)
-
-            # ── Phase 3: build cards + ghost ─────────────────────────────────
-            draw_build_cards(
-                self.screen, self.font,
-                self.res.minerals,
-                self.build_state,
-                self.ghost_kind,
-                nuke_available=self.res.nuke_available,
-            )
-            if self.build_state == BuildState.CONSTRUCTING and self.ghost_kind:
-                draw_ghost(
-                    self.screen, self.font,
-                    ghost_surf   = self._ghost_surfs.get(self.ghost_kind),
-                    ghost_screen = self.ghost_pos,
-                    snap_slot    = self.ghost_slot,
-                    snap_valid   = self.ghost_valid,
-                    cam_x        = cam_x,
+            # Screen-fixed HUD layer — hidden during VICTORY / DEFEAT overlay
+            if self.game_state == GameState.PLAYING:
+                draw_hud(
+                    self.screen, self.font, fps,
+                    self.res, cam_x,
+                    income_flash=self.income_flash > 0,
+                    slot_buildings=self.slot_buildings,
                 )
-            elif self.build_state == BuildState.NUKING:
-                draw_nuke_ghost(self.screen, self.font, self.ghost_pos)
+                draw_unit_cards(self.screen, self.font, self.units)
+
+                # ── Build cards + ghost ───────────────────────────────────────
+                draw_build_cards(
+                    self.screen, self.font,
+                    self.res.minerals,
+                    self.build_state,
+                    self.ghost_kind,
+                    nuke_available=self.res.nuke_available,
+                )
+                if self.build_state == BuildState.CONSTRUCTING and self.ghost_kind:
+                    draw_ghost(
+                        self.screen, self.font,
+                        ghost_surf   = self._ghost_surfs.get(self.ghost_kind),
+                        ghost_screen = self.ghost_pos,
+                        snap_slot    = self.ghost_slot,
+                        snap_valid   = self.ghost_valid,
+                        cam_x        = cam_x,
+                    )
+                elif self.build_state == BuildState.NUKING:
+                    draw_nuke_ghost(self.screen, self.font, self.ghost_pos)
 
             # ── Phase 4: nuke VFX overlays ────────────────────────────────────
             # Red-alert flash (fades 90→0 frames after detonation)
@@ -1127,8 +1165,8 @@ class GameLoop:
                 t    = self.nuke_circle_timer / 180
                 a    = int(t * 200)
                 ring = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-                pygame.draw.circle(ring, (255, 100, 30, a),       (sx_n, sy_n), 300, 3)
-                pygame.draw.circle(ring, (255, 200, 60, a // 4),  (sx_n, sy_n), 300)
+                pygame.draw.circle(ring, (255, 100, 30, a),       (sx_n, sy_n), 450, 3)
+                pygame.draw.circle(ring, (255, 200, 60, a // 4),  (sx_n, sy_n), 450)
                 self.screen.blit(ring, (0, 0))
                 self.nuke_circle_timer -= 1
                 if self.nuke_circle_timer <= 0:

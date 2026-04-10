@@ -184,6 +184,12 @@ class Building(GameSprite):
         self._income_bonus:     int = spec.get("income_bonus", 0)
         self.spawn_timer:       int = 0   # counts up each frame
 
+        # Phase 4b: Armour plate — HQs absorb 70 % of all incoming damage.
+        # Applied inside take_damage() BEFORE subtracting HP, so the effective
+        # damage is:  effective = int(raw_amount × (1 − damage_reduction))
+        # Slot buildings have DR = 0.0 (no reduction).
+        self.damage_reduction: float = 0.70 if is_hq else 0.0
+
         # Phase 4: optional callback fired immediately when this HQ is destroyed.
         # Signature: on_hq_death(team: int) -> None
         # Set by GameLoop._init_scene so main.py can react without polling.
@@ -250,9 +256,24 @@ class Building(GameSprite):
         amount: int,
         vfx_callback: Optional[VFXCallback] = None,
     ) -> None:
+        """
+        Apply *amount* damage, honouring the building's damage_reduction.
+
+        Damage pipeline (HQ with DR = 0.70)
+        ------------------------------------
+          raw_amount   = 15   (marine strike)
+          effective    = max(1, int(15 × (1 − 0.70)))
+                       = max(1, int(15 × 0.30))  = max(1, 4) = 4
+          hp_new       = max(0, hp − 4)
+
+        Slot buildings have DR = 0.0 — they receive the full raw amount.
+        Minimum 1 damage is always applied so no hit is a complete wiff.
+        """
         if self.is_dead:
             return
-        self.hp = max(0, self.hp - amount)
+        # Armour reduction applied BEFORE subtracting HP
+        effective = max(1, int(amount * (1.0 - self.damage_reduction)))
+        self.hp = max(0, self.hp - effective)
         if self.hp == 0:
             self.die(vfx_callback)
 
