@@ -44,6 +44,7 @@ from src.asset_manager import AssetManager
 from src.sprite        import Building, Unit, VFXSprite
 from src.battle        import BattleManager
 from src.logic         import ResourceManager, BUILDING_SPECS, BASE_INCOME, BuildState, GameState
+from src.ai            import AIController, AI_ALL_SLOTS
 import src.shared as shared
 
 # ── Screen / world constants ──────────────────────────────────────────────────
@@ -727,6 +728,13 @@ class GameLoop:
         self._enemy_bot_timer: int = 0     # bot fires at t=480 first
         self._enemy_spawn_rate: int = 480  # 8 s @ 60 fps per lane
 
+        # ── AI grid controller + economy (Phase 5) ────────────────────────────
+        # AIController manages the enemy's 32 mirrored building slots.
+        # self.ai_res is a SEPARATE ResourceManager — the AI earns its own
+        # minerals independently of the player's self.res.
+        self.ai_controller: AIController  = AIController()
+        self.ai_res:        ResourceManager = ResourceManager(starting=150)
+
         print(f"[Scene] Reset.  Slot buildings: {len(self.slot_buildings)}  "
               f"Income: {self.res.income_per_cycle}/cycle")
 
@@ -1066,7 +1074,39 @@ class GameLoop:
                     self.units.append(u)
                     print("[Enemy] spawned marine → bottom lane")
 
-                # 4) Combat + collision + cleanup
+                # 4a) AI economy cycle (independent from player's self.res)
+                self.ai_res.update()
+
+                # 4b) AI slot buildings auto-spawn (team 1 units)
+                for _ab in self.ai_controller.slot_buildings:
+                    _ar = _ab.update()
+                    if _ar:
+                        _au_type, _asp, _al = _ar
+                        _au = make_unit_for_lane(
+                            _au_type, _asp, _al, team=1, manager=self.manager
+                        )
+                        self.units.append(_au)
+
+                # 4c) AI strategic decisions (throttled internally to 1 per 2 s)
+                #     Returns True if the AI fired its emergency nuke this frame.
+                _ai_nuke = self.ai_controller.update(
+                    frame     = self.frame,
+                    units     = self.units,
+                    ai_res    = self.ai_res,
+                    manager   = self.manager,
+                    ai_hq     = self.enemy_hq,
+                    spawn_vfx = self.spawn_vfx,
+                )
+                if _ai_nuke and self.ai_controller.last_nuke_target:
+                    # Trigger the same VFX the player gets when using the nuke
+                    self.nuke_flash        = 90
+                    self.shake_timer       = 30
+                    self.shake_amp         = 10
+                    self.nuke_circle       = self.ai_controller.last_nuke_target
+                    self.nuke_circle_timer = 180
+                    print("[AI] Nuke VFX triggered on main.py side")
+
+                # 5) Combat + collision + cleanup
                 BattleManager.process_combat(
                     self.units,
                     self.spawn_vfx,
@@ -1108,6 +1148,10 @@ class GameLoop:
             self.enemy_hq.draw(self.screen, cam_offset)
 
             for b in self.slot_buildings:
+                b.draw(self.screen, cam_offset)
+
+            # AI slot buildings (team 1, mirrored grid on far-right side)
+            for b in self.ai_controller.slot_buildings:
                 b.draw(self.screen, cam_offset)
 
             for u in self.units:
