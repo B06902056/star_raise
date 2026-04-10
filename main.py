@@ -43,7 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.asset_manager import AssetManager
 from src.sprite        import Building, Unit, VFXSprite
 from src.battle        import BattleManager
-from src.logic         import ResourceManager, BUILDING_SPECS, BASE_INCOME, BuildState
+from src.logic         import ResourceManager, BUILDING_SPECS, BASE_INCOME, BuildState, GameState
 import src.shared as shared
 
 # ── Screen / world constants ──────────────────────────────────────────────────
@@ -116,14 +116,20 @@ COLOR_BOT_LANE  = (255, 160,  60)
 
 CARD_W, CARD_H = 90, 58
 CARD_Y         = SCREEN_H - CARD_H - 8
-CARD_KINDS     = ["barracks", "refinery", None]   # None = demolish button
+# Four build cards:  [0] Barracks  [1] Refinery  [2] Nuke  [3] Demolish
+# Barracks + Refinery sit on the left; Nuke + Demolish sit on the right.
+CARD_KINDS = ["barracks", "refinery", "nuke", None]   # None = demolish button
 
 CARD_RECTS: list[pygame.Rect] = [
-    pygame.Rect(10  + i * (CARD_W + 8), CARD_Y, CARD_W, CARD_H)
-    for i in range(3)
+    pygame.Rect(10 + i * (CARD_W + 8), CARD_Y, CARD_W, CARD_H)
+    for i in range(2)                      # [0] barracks   [1] refinery
 ]
-# Override last card to sit on the right (demolish button)
-CARD_RECTS[2] = pygame.Rect(SCREEN_W - CARD_W - 10, CARD_Y, CARD_W, CARD_H)
+CARD_RECTS.append(pygame.Rect(           # [2] nuke  — second card from right
+    SCREEN_W - (CARD_W + 8) * 2 - 10, CARD_Y, CARD_W, CARD_H
+))
+CARD_RECTS.append(pygame.Rect(           # [3] demolish — far right
+    SCREEN_W - CARD_W - 10, CARD_Y, CARD_W, CARD_H
+))
 
 CARD_COSTS = {
     "barracks": BUILDING_SPECS["barracks"]["cost"],   # 100
@@ -380,65 +386,80 @@ def draw_hud(
 
 
 def draw_build_cards(
-    screen:      pygame.Surface,
-    font:        pygame.font.Font,
-    minerals:    int,
-    build_state: BuildState,
-    ghost_kind:  str | None,
+    screen:         pygame.Surface,
+    font:           pygame.font.Font,
+    minerals:       int,
+    build_state:    BuildState,
+    ghost_kind:     str | None,
+    nuke_available: bool = True,
 ) -> None:
     """
-    Bottom HUD — three build cards:
-      [Barracks 100]  [Refinery 200]        [DEMOLISH]
+    Bottom HUD — four build cards:
+      [Barracks 100]  [Refinery 200]        [NUKE]  [DEMOLISH]
 
     Visual states:
-      - Active card (being dragged):  bright border + lighter bg
-      - Demolish ON:                  red bg
-      - Insufficient minerals:        dimmed label + orange cost
+      - Active card (being dragged/selected):  bright border + lighter bg
+      - Demolish / Nuke ON:                    coloured bg
+      - Insufficient minerals / nuke expended: dimmed label
     """
     for i, rect in enumerate(CARD_RECTS):
         kind = CARD_KINDS[i]
         is_demolish = (kind is None)
+        is_nuke     = (kind == "nuke")
 
-        # Background
+        # ── Demolish card ──────────────────────────────────────────────────
         if is_demolish:
             active = (build_state == BuildState.DEMOLISHING)
-            bg = (160, 30, 30) if active else (60, 20, 20)
+            bg     = (160, 30, 30) if active else (60, 20, 20)
             border = (255, 80, 80) if active else (120, 60, 60)
+            pygame.draw.rect(screen, bg,     rect)
+            pygame.draw.rect(screen, border, rect, 2)
+            label     = "DEMOLISH"
+            label_col = (255, 100, 100) if active else (200, 120, 120)
+            hint      = "[D key]"
+            hint_col  = (160, 80, 80)
+            screen.blit(font.render(label, True, label_col), (rect.x + 6, rect.y + 8))
+            screen.blit(font.render(hint,  True, hint_col),  (rect.x + 6, rect.y + 26))
+
+        # ── Nuke card ──────────────────────────────────────────────────────
+        elif is_nuke:
+            active = (ghost_kind == "nuke" and build_state == BuildState.NUKING)
+            bg     = (120, 20, 20) if active else (50, 12, 12)
+            border = (255, 60, 60) if active else (
+                (200, 80, 80) if nuke_available else (50, 40, 40)
+            )
+            pygame.draw.rect(screen, bg,     rect)
+            pygame.draw.rect(screen, border, rect, 2)
+            label     = "☢ NUKE"
+            label_col = (255, 100, 80) if nuke_available else (80, 60, 60)
+            hint      = "ARMED" if nuke_available else "EXPENDED"
+            hint_col  = (255, 60, 60) if nuke_available else (80, 70, 70)
+            note      = "300px AoE"
+            note_col  = (160, 100, 100) if nuke_available else (60, 50, 50)
+            screen.blit(font.render(label, True, label_col), (rect.x + 6, rect.y + 8))
+            screen.blit(font.render(hint,  True, hint_col),  (rect.x + 6, rect.y + 26))
+            screen.blit(font.render(note,  True, note_col),  (rect.x + 6, rect.y + 42))
+
+        # ── Building card (barracks / refinery) ────────────────────────────
         else:
-            active = (ghost_kind == kind and build_state == BuildState.CONSTRUCTING)
-            cost   = CARD_COSTS[kind]
+            active     = (ghost_kind == kind and build_state == BuildState.CONSTRUCTING)
+            cost       = CARD_COSTS[kind]
             affordable = (minerals >= cost)
-            bg     = (40, 70, 50) if (active and affordable) else (25, 40, 60)
-            border = (80, 220, 120) if active else (
+            bg         = (40, 70, 50) if (active and affordable) else (25, 40, 60)
+            border     = (80, 220, 120) if active else (
                 (100, 160, 220) if affordable else (80, 60, 60)
             )
-
-        pygame.draw.rect(screen, bg,     rect)
-        pygame.draw.rect(screen, border, rect, 2)
-
-        # Label
-        if is_demolish:
-            label = "DEMOLISH"
-            label_col = (255, 100, 100) if build_state == BuildState.DEMOLISHING else (200, 120, 120)
-            hint  = "[D key]"
-            hint_col = (160, 80, 80)
-        else:
-            cost = CARD_COSTS[kind]
-            affordable = (minerals >= cost)
-            label = kind.upper()
+            pygame.draw.rect(screen, bg,     rect)
+            pygame.draw.rect(screen, border, rect, 2)
+            label     = kind.upper()
             label_col = (200, 230, 200) if affordable else (120, 100, 100)
-            hint  = f"{cost} min"
-            hint_col = COLOR_GOLD if affordable else (200, 120, 60)
-
-        screen.blit(font.render(label, True, label_col),
-                    (rect.x + 6, rect.y + 8))
-        screen.blit(font.render(hint,  True, hint_col),
-                    (rect.x + 6, rect.y + 26))
-        if not is_demolish:
-            unit = BUILDING_SPECS[kind]["unit_type"]
-            rate = BUILDING_SPECS[kind]["spawn_rate_frames"] // 60
-            screen.blit(font.render(f"→{unit} {rate}s", True, (120, 160, 200)),
-                        (rect.x + 6, rect.y + 42))
+            hint      = f"{cost} min"
+            hint_col  = COLOR_GOLD if affordable else (200, 120, 60)
+            unit      = BUILDING_SPECS[kind]["unit_type"]
+            rate      = BUILDING_SPECS[kind]["spawn_rate_frames"] // 60
+            screen.blit(font.render(label,              True, label_col),      (rect.x + 6, rect.y + 8))
+            screen.blit(font.render(hint,               True, hint_col),       (rect.x + 6, rect.y + 26))
+            screen.blit(font.render(f"→{unit} {rate}s", True, (120, 160, 200)),(rect.x + 6, rect.y + 42))
 
 
 def draw_ghost(
@@ -480,9 +501,39 @@ def draw_ghost(
         screen.blit(alpha_surf, rect)
 
 
-def draw_result_overlay(screen: pygame.Surface, result: str) -> None:
+def draw_nuke_ghost(
+    screen:       pygame.Surface,
+    font:         pygame.font.Font,
+    ghost_screen: tuple[int, int],
+) -> None:
+    """
+    Nuke-targeting cursor: crosshair + translucent 300 px AoE circle.
+    Drawn during BuildState.NUKING so the player can see blast coverage.
+    """
+    gx, gy = ghost_screen
+
+    # Semi-transparent AoE fill
+    aoe = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+    pygame.draw.circle(aoe, (220, 30, 30, 45), (gx, gy), 300)
+    pygame.draw.circle(aoe, (255, 80, 60, 180), (gx, gy), 300, 2)
+    screen.blit(aoe, (0, 0))
+
+    # Crosshair lines
+    for dx, dy in ((-24, 0), (24, 0), (0, -24), (0, 24)):
+        pygame.draw.line(screen, (255, 60, 60),
+                         (gx, gy), (gx + dx, gy + dy), 2)
+    pygame.draw.circle(screen, (255, 100, 80), (gx, gy), 9, 2)
+
+    # Label
+    screen.blit(
+        font.render("☢ NUKE  (release to detonate)", True, (255, 80, 80)),
+        (gx + 14, gy - 18),
+    )
+
+
+def draw_result_overlay(screen: pygame.Surface, result: GameState) -> None:
     overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-    if result == "VICTORY":
+    if result == GameState.VICTORY:
         overlay.fill((20, 80, 20, 180))
         color = COLOR_VICTORY
         text  = "VICTORY"
@@ -579,9 +630,14 @@ class GameLoop:
         self.vfx_list:  list[VFXSprite] = []
         self.units:     list[Unit]      = []
         self.frame                      = 0
-        self.game_result: str | None    = None
+        self.game_state:  GameState     = GameState.PLAYING
         self.debug_mode:  bool          = False
         self.income_flash:int           = 0
+        # Nuke red-alert flash (counts down 90 → 0 after detonation)
+        self.nuke_flash:        int                       = 0
+        # Nuke blast circle (world pos + fade timer)
+        self.nuke_circle:       tuple[float,float] | None = None
+        self.nuke_circle_timer: int                       = 0
 
         # ── Phase 3: Build / demolish state ───────────────────────────────────
         self.build_state: BuildState     = BuildState.NONE
@@ -618,6 +674,16 @@ class GameLoop:
             pos=(WORLD_W - 80, WORLD_H // 2),
             hp=800, team=1,
             lane="none", is_hq=True,
+        )
+
+        # Phase 4: HQ death callbacks — transition game_state immediately
+        # when a unit's attack_building() kills an HQ, without waiting for
+        # the next _check_victory() frame poll.
+        self.player_hq.on_hq_death = lambda _t: setattr(
+            self, "game_state", GameState.DEFEAT
+        )
+        self.enemy_hq.on_hq_death  = lambda _t: setattr(
+            self, "game_state", GameState.VICTORY
         )
 
         # ── Slot buildings (auto-spawn, income) ───────────────────────────────
@@ -663,14 +729,20 @@ class GameLoop:
 
     # ── Victory check ─────────────────────────────────────────────────────────
     def _check_victory(self) -> None:
-        if self.game_result:
+        """
+        Belt-and-suspenders poll each frame.
+        The primary trigger is Building.on_hq_death callback (fires instantly
+        inside Building.die()), so this only fires when the callback wasn't set
+        (e.g. after a scene reset edge case) or as a safety net.
+        """
+        if self.game_state != GameState.PLAYING:
             return
         if self.enemy_hq.is_dead:
-            self.game_result = "VICTORY"
+            self.game_state = GameState.VICTORY
             shared.write({"game_result": "VICTORY"})
             print("[Game] VICTORY")
         elif self.player_hq.is_dead:
-            self.game_result = "DEFEAT"
+            self.game_state = GameState.DEFEAT
             shared.write({"game_result": "DEFEAT"})
             print("[Game] DEFEAT")
 
@@ -678,7 +750,7 @@ class GameLoop:
     def _push_state(self) -> None:
         shared.write({
             "frame":        self.frame,
-            "game_result":  self.game_result,
+            "game_result":  self.game_state.name,
 
             # Economy
             "minerals":     self.res.minerals,
@@ -798,6 +870,14 @@ class GameLoop:
                                     else:
                                         self.build_state = BuildState.DEMOLISHING
                                         self.ghost_kind  = None
+                                elif kind == "nuke":
+                                    # Nuke card — enter NUKING if still available
+                                    if self.res.nuke_available:
+                                        self.build_state = BuildState.NUKING
+                                        self.ghost_kind  = "nuke"
+                                        self.ghost_pos   = (mx, my)
+                                        self.ghost_slot  = None
+                                        self.ghost_valid = True
                                 else:
                                     # Building card — enter CONSTRUCTING if affordable
                                     cost = CARD_COSTS[kind]
@@ -834,6 +914,9 @@ class GameLoop:
                         self.ghost_pos = (mx, my)
                         wx, wy = self.camera.screen_to_world(mx, my)
                         self.ghost_slot, self.ghost_valid = self._find_nearest_slot(wx, wy)
+                    elif self.build_state == BuildState.NUKING:
+                        # Free-aim cursor — no slot snapping needed
+                        self.ghost_pos = (mx, my)
                     elif self.build_state == BuildState.NONE and lmb_down:
                         self.camera.on_mouse_move(mx)
 
@@ -855,6 +938,25 @@ class GameLoop:
                                         f"minerals={self.res.minerals}"
                                     )
                             # Always exit constructing mode on mouse-up
+                            self.build_state = BuildState.NONE
+                            self.ghost_kind  = None
+                            self.ghost_slot  = None
+
+                        elif self.build_state == BuildState.NUKING:
+                            # Detonate nuke at world cursor position
+                            wx, wy = self.camera.screen_to_world(mx, my)
+                            fired = self.res.launch_nuke(
+                                (wx, wy),
+                                self.units,
+                                self.all_buildings,
+                                self.spawn_vfx,
+                            )
+                            if fired:
+                                # Red-alert flash for 90 frames (1.5 s)
+                                self.nuke_flash        = 90
+                                # Persistent blast circle for 180 frames (3 s)
+                                self.nuke_circle       = (wx, wy)
+                                self.nuke_circle_timer = 180
                             self.build_state = BuildState.NONE
                             self.ghost_kind  = None
                             self.ghost_slot  = None
@@ -894,7 +996,7 @@ class GameLoop:
                         lmb_down = False
 
             # ── Game logic ────────────────────────────────────────────────────
-            if not self.game_result:
+            if self.game_state == GameState.PLAYING:
 
                 # 1) Player income cycle
                 if self.res.update():
@@ -994,6 +1096,7 @@ class GameLoop:
                 self.res.minerals,
                 self.build_state,
                 self.ghost_kind,
+                nuke_available=self.res.nuke_available,
             )
             if self.build_state == BuildState.CONSTRUCTING and self.ghost_kind:
                 draw_ghost(
@@ -1004,9 +1107,36 @@ class GameLoop:
                     snap_valid   = self.ghost_valid,
                     cam_x        = cam_x,
                 )
+            elif self.build_state == BuildState.NUKING:
+                draw_nuke_ghost(self.screen, self.font, self.ghost_pos)
 
-            if self.game_result:
-                draw_result_overlay(self.screen, self.game_result)
+            # ── Phase 4: nuke VFX overlays ────────────────────────────────────
+            # Red-alert flash (fades 90→0 frames after detonation)
+            if self.nuke_flash > 0:
+                alpha = int((self.nuke_flash / 90) * 190)
+                flash_surf = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+                flash_surf.fill((220, 20, 20, alpha))
+                self.screen.blit(flash_surf, (0, 0))
+                self.nuke_flash -= 1
+
+            # Blast circle (fades 180→0 frames, drawn in world-to-screen space)
+            if self.nuke_circle is not None and self.nuke_circle_timer > 0:
+                wx_n, wy_n = self.nuke_circle
+                sx_n = int(wx_n) - int(cam_x)
+                sy_n = int(wy_n)
+                t    = self.nuke_circle_timer / 180
+                a    = int(t * 200)
+                ring = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+                pygame.draw.circle(ring, (255, 100, 30, a),       (sx_n, sy_n), 300, 3)
+                pygame.draw.circle(ring, (255, 200, 60, a // 4),  (sx_n, sy_n), 300)
+                self.screen.blit(ring, (0, 0))
+                self.nuke_circle_timer -= 1
+                if self.nuke_circle_timer <= 0:
+                    self.nuke_circle = None
+
+            # ── Phase 4: Victory / Defeat overlay ────────────────────────────
+            if self.game_state != GameState.PLAYING:
+                draw_result_overlay(self.screen, self.game_state)
 
             pygame.display.flip()
 

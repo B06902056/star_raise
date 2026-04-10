@@ -27,6 +27,8 @@ Building auto-spawn table (BUILDING_SPECS)
 """
 
 from __future__ import annotations
+import math
+import random
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
@@ -48,6 +50,25 @@ class BuildState(Enum):
     NONE         = auto()
     CONSTRUCTING = auto()
     DEMOLISHING  = auto()
+    NUKING       = auto()   # Phase 4: player is aiming the one-time nuke
+
+# ── GameState Enum ────────────────────────────────────────────────────────────
+class GameState(Enum):
+    """
+    Top-level game lifecycle state.
+
+    PLAYING : Normal gameplay — units spawn, buildings fire, HQs take damage.
+    VICTORY : Enemy HQ reached 0 HP.  Overlay shown; all logic paused.
+    DEFEAT  : Player HQ reached 0 HP.  Overlay shown; all logic paused.
+
+    Transitions are set by:
+      (a) Building.on_hq_death callback (fast, event-driven), or
+      (b) GameLoop._check_victory() polling each frame (belt-and-suspenders).
+    """
+    PLAYING = auto()
+    VICTORY = auto()
+    DEFEAT  = auto()
+
 
 # ── Income constants ──────────────────────────────────────────────────────────
 INCOME_CYCLE_FRAMES: int = 300    # 5 s @ 60 fps
@@ -95,6 +116,8 @@ class ResourceManager:
         self._cycle_timer:    int  = 0
         # List of Building sprites placed in player slots
         self._slot_buildings: list = []
+        # One-time tactical nuke weapon (resets to True on scene reset)
+        self.nuke_available:  bool = True
 
     # ── Building registration ──────────────────────────────────────────────────
     def register_building(self, building: Building) -> None:
@@ -176,6 +199,70 @@ class ResourceManager:
         """
         self.minerals += amount
         print(f"[Economy] Refund +{amount}  →  {self.minerals} minerals")
+
+    # ── Nuke ──────────────────────────────────────────────────────────────────
+    def launch_nuke(
+        self,
+        target_pos,          # tuple[float, float]  — world-space detonation point
+        units,               # list[Unit]
+        buildings,           # list[Building]
+        vfx_callback=None,   # Optional[Callable[[tuple[float,float]], None]]
+        radius: float = 300.0,
+    ) -> bool:
+        """
+        Fire the one-time tactical nuke at *target_pos*.
+
+        Returns True if the nuke was launched; False if already expended.
+
+        AoE damage model
+        ----------------
+        • Every Unit within *radius* pixels:
+              take_damage(9999)  →  instant kill regardless of HP/armour.
+
+        • Every Building within *radius* pixels:
+              take_damage( int(b.max_hp × 0.5) )  →  exactly 50 % of max HP.
+              Slot buildings (max_hp ≤ 500) die if already below 50 % HP.
+              HQs (max_hp = 800) survive a single nuke hit (take 400 damage),
+              but a second nuke (if ever added) would finish them off.
+
+        • VFX: 12 explosion sprites scattered randomly inside the blast circle.
+
+        Side-effect: sets nuke_available = False (one-shot weapon).
+        """
+        if not self.nuke_available:
+            return False
+        self.nuke_available = False
+
+        tx, ty = float(target_pos[0]), float(target_pos[1])
+
+        # ── Damage units (instant kill) ───────────────────────────────────────
+        for u in units:
+            if u.is_dead:
+                continue
+            if math.hypot(u.pos[0] - tx, u.pos[1] - ty) <= radius:
+                u.take_damage(9999, vfx_callback)
+
+        # ── Damage buildings (50 % max-HP) ────────────────────────────────────
+        for b in buildings:
+            if b.is_dead:
+                continue
+            if math.hypot(b.pos[0] - tx, b.pos[1] - ty) <= radius:
+                dmg = int(b.max_hp * 0.5)
+                b.take_damage(dmg, vfx_callback)
+
+        # ── Scatter VFX explosions across the blast zone ──────────────────────
+        if vfx_callback:
+            for _ in range(12):
+                ox = random.uniform(-radius * 0.85, radius * 0.85)
+                oy = random.uniform(-radius * 0.85, radius * 0.85)
+                if math.hypot(ox, oy) <= radius:
+                    vfx_callback((tx + ox, ty + oy))
+
+        print(
+            f"[Nuke] Detonated at ({tx:.0f}, {ty:.0f})  "
+            f"radius={radius}  minerals={self.minerals}"
+        )
+        return True
 
     def __repr__(self) -> str:
         alive = sum(1 for b in self._slot_buildings if not b.is_dead)

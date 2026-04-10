@@ -184,6 +184,12 @@ class Building(GameSprite):
         self._income_bonus:     int = spec.get("income_bonus", 0)
         self.spawn_timer:       int = 0   # counts up each frame
 
+        # Phase 4: optional callback fired immediately when this HQ is destroyed.
+        # Signature: on_hq_death(team: int) -> None
+        # Set by GameLoop._init_scene so main.py can react without polling.
+        # Non-HQ buildings leave this as None.
+        self.on_hq_death = None
+
     # ── Properties ────────────────────────────────────────────────────────────
     @property
     def income_bonus(self) -> int:
@@ -254,6 +260,10 @@ class Building(GameSprite):
         self.is_dead = True
         if vfx_callback:
             vfx_callback(tuple(self.pos))
+        # Phase 4: fire HQ-death callback immediately so GameLoop can
+        # transition to VICTORY/DEFEAT without waiting for the polling check.
+        if self.is_hq and self.on_hq_death is not None:
+            self.on_hq_death(self.team)
         print(f"[Building] {self.kind} (team={self.team}) destroyed")
 
     def demolish(
